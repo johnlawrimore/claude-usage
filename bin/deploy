@@ -1,0 +1,20 @@
+#!/bin/sh
+# Deploys this checkout to the live Claude Code skill directory.
+#
+# Default target is ~/.claude/skills/claude-usage. Override with TARGET_DIR
+# for testing against a sandbox directory instead of the real deployed copy.
+set -eu
+
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+target="${TARGET_DIR:-$HOME/.claude/skills/claude-usage}"
+
+if [ "$repo_root" = "$(cd "$target" 2>/dev/null && pwd)" ]; then
+  echo "deploy: checkout is already the target ($target); nothing to do" >&2
+  exit 0
+fi
+
+mkdir -p "$target"
+
+rsync -a -i --delete --exclude='.git' --exclude='bin' \
+  --exclude='__pycache__' --exclude='.DS_Store' \
+  "$repo_root/" "$target/"

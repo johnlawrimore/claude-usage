@@ -1,0 +1,7 @@
+# Normalize line endings so a Windows clone can't corrupt the scripts.
+* text=auto eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+# Windows batch launcher wants CRLF.
+*.cmd text eol=crlf
