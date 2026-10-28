@@ -4,6 +4,14 @@ All notable changes to claude-usage are documented here. Versioning follows
 [semver](https://semver.org/): breaking changes to the JSON output contract bump the major
 version, new fields or flags bump the minor, fixes bump the patch.
 
+## [2.0.0] - 2026-10-27
+
+- Replace the old posture vocabulary with Accelerate, Cruise, Coast, Brake and Park.
+- Target useful quota consumption through reset, with explicit expansion guidance and a
+  five-minute checkpoint reserve. Preserve all quota schedule and multiplier display fields.
+- Emit `posture_instruction` and `posture_policy`; recompute legacy hysteresis states.
+- Keep required review and verification standards invariant while changing work admission.
+
 ## [1.0.0] - 2026-09-25
 
 First public release.
@@ -15,7 +23,7 @@ First public release.
   throttling decision it makes.
 - Standalone CLI (`scripts/check-usage.py`, with `check-usage.sh` and `check-usage.cmd`
   launchers) reporting the 5-hour session, weekly, and per-model weekly limits. Flags: `--json`,
-  `--fresh`, `--cache-only`, `--version`. Python 3.8+, standard library only; macOS, Linux, and
+  `--fresh`, `--cache-only`, `--version`. Python 3.9+, standard library only; macOS, Linux, and
   Windows.
 - Per-limit `posture` on a five-rung ladder (`normal`, `measured`, `frugal`, `conserve`,
   `wind_down`) driven by sustainable pace rather than raw fullness, capped by the wall-clock

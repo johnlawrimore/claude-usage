@@ -23,7 +23,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-SCRIPT_PATH = os.path.normpath(
+SCRIPT_PATH = os.environ.get("USAGE_UNDER_TEST") or os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "scripts", "check-usage.py")
 )
 
@@ -83,7 +83,7 @@ class CheckUsageTestCase(unittest.TestCase):
 class TestParseLimits(CheckUsageTestCase):
     def test_modern_limits_shape(self):
         data = {"limits": [
-            {"kind": "session", "percent": 42, "severity": "normal", "is_active": True,
+            {"kind": "session", "percent": 42, "severity": "cruise", "is_active": True,
              "resets_at": "2099-01-01T00:00:00Z", "scope": None},
         ]}
         out = self.mod.parse_limits(data)
@@ -157,28 +157,24 @@ class TestLimitPosture(CheckUsageTestCase):
         return base
 
     def test_high_percent_alone_does_not_escalate_when_on_pace(self):
-        # Replaces test_percent_band_boundaries_session: the percent-band table (PERCENT_BANDS)
-        # was deleted 2026-08-11 because it acted on fullness alone. This protects the new
-        # guarantee: a high percent with the clock still on pace stays 'normal'. Exact incident
-        # case -- weekly_all at 97% with 7999s (~2h13m) left in a 7-day window is AHEAD of pace
-        # (2h is ~1.2% of a week), yet the old percent band said wind_down and halted a healthy
-        # six-runner fleet. window ratio = 0.97 / ((604800-7999)/604800) = 0.983 < 1.0 -> normal.
+        # Posture is decided on pace, not on fullness alone: a high percent with the clock still
+        # ahead of pace must stay 'normal'. weekly_all at 97% with 7999s (~2h13m) left in a 7-day
+        # window is AHEAD of pace (2h is ~1.2% of a week): window ratio =
+        # 0.97 / ((604800-7999)/604800) = 0.983 < 1.0 -> normal.
         l = self._limit(kind="weekly_all", percent=97, resets_in_seconds=7999)
-        self.assertEqual(self.mod.limit_posture(l)[0], "normal")
+        self.assertEqual(self.mod.limit_posture(l)[0], "cruise")
 
     def test_same_pace_same_posture_regardless_of_kind(self):
-        # Replaces test_percent_band_boundaries_weekly_all: per-kind percent band tables (higher
-        # thresholds for weekly_all) were deleted 2026-08-11 along with the rest of the percent
-        # axis. Protects the new guarantee: no per-kind behavior survives -- session and
-        # weekly_all at the identical pace (same percent consumed, same fraction of their
-        # respective windows elapsed) land on the identical posture. Both at 80% consumed with
-        # half their window elapsed -> ratio 1.6 -> frugal, for either kind.
+        # Posture has no per-kind behavior: session and weekly_all at the identical pace (same
+        # percent consumed, same fraction of their respective windows elapsed) land on the
+        # identical posture. Both at 80% consumed with half their window elapsed -> ratio 1.6 ->
+        # frugal, for either kind.
         session = self._limit(kind="session", percent=80,
                               resets_in_seconds=self.mod.WINDOW_LENGTHS["session"] // 2)
         weekly = self._limit(kind="weekly_all", percent=80,
                              resets_in_seconds=self.mod.WINDOW_LENGTHS["weekly_all"] // 2)
-        self.assertEqual(self.mod.limit_posture(session)[0], "frugal")
-        self.assertEqual(self.mod.limit_posture(weekly)[0], "frugal")
+        self.assertEqual(self.mod.limit_posture(session)[0], "brake")
+        self.assertEqual(self.mod.limit_posture(weekly)[0], "brake")
 
     def test_provider_severity_is_discarded_and_does_not_change_posture(self):
         # The provider field is percent-derived, so it is deliberately absent from the public
@@ -187,8 +183,8 @@ class TestLimitPosture(CheckUsageTestCase):
         elevated = self._limit(percent=10, severity="warning")
         posture_n, reason_n = self.mod.limit_posture(normal)
         posture_e, reason_e = self.mod.limit_posture(elevated)
-        self.assertEqual(posture_n, "normal")
-        self.assertEqual(posture_e, "normal")
+        self.assertEqual(posture_n, "cruise")
+        self.assertEqual(posture_e, "cruise")
         self.assertNotIn("severity", reason_e)
         parsed = self.mod.parse_limits({"limits": [{
             "kind": "session", "percent": 10, "severity": "warning",
@@ -197,62 +193,51 @@ class TestLimitPosture(CheckUsageTestCase):
         self.assertNotIn("severity", parsed[0])
 
     def test_severity_does_not_change_posture_percentless_meter(self):
-        # Replaces test_percentless_meter_with_elevated_severity_escalates: previously a
-        # percentless meter with elevated severity escalated one rung via the (now-deleted)
-        # severity bump. Protects the same new guarantee as above for the percentless case:
-        # neither axis can judge a meter with no percent, so posture stays 'normal' regardless
-        # of severity.
+        # Same guarantee as above for the percentless case: neither axis can judge a meter with
+        # no percent, so posture stays 'normal' regardless of severity.
         l = self._limit(percent=None, severity="warning")
-        self.assertEqual(self.mod.limit_posture(l)[0], "normal")
+        self.assertEqual(self.mod.limit_posture(l)[0], "cruise")
 
     def test_near_reset_high_percent_no_special_case_needed_pace_governs(self):
-        # Replaces test_session_near_reset_relief: the session-only near-reset relief (percent
-        # >= 90 relaxed one rung when resets_in_seconds < 900) was deleted 2026-08-11 -- it
-        # existed to soften a high PERCENT shortly before reset, and with percent gone as a
-        # decision input there is nothing left to relieve. Protects the new guarantee: pure pace
-        # already gets this right with no kind-specific carve-out. 95% consumed with only 500s
-        # left is ahead of pace for BOTH a 5h session (97% of the window elapsed) and a 7-day
-        # weekly window (99.9% elapsed) -- ratio < 1.0 either way -> normal, not the 'frugal'
-        # relief-band compromise the old carve-out produced, and no per-kind logic is needed to
-        # get there.
+        # Pure pace gets a high percent shortly before reset right with no kind-specific
+        # carve-out. 95% consumed with only 500s left is ahead of pace for BOTH a 5h session (97%
+        # of the window elapsed) and a 7-day weekly window (99.9% elapsed) -- ratio < 1.0 either
+        # way -> normal, with no per-kind logic needed to get there.
         session = self._limit(kind="session", percent=95, resets_in_seconds=500)
         weekly = self._limit(kind="weekly_all", percent=95, resets_in_seconds=500)
-        self.assertEqual(self.mod.limit_posture(session)[0], "normal")
-        self.assertEqual(self.mod.limit_posture(weekly)[0], "normal")
+        self.assertEqual(self.mod.limit_posture(session)[0], "accelerate")
+        self.assertEqual(self.mod.limit_posture(weekly)[0], "accelerate")
 
     def test_unknown_kind_gets_no_window_pace(self):
-        # Replaces test_unknown_kind_uses_default_bands: the default percent-band table used for
-        # an unrecognized kind was deleted along with the rest of the percent axis. Protects the
-        # new guarantee: an unknown kind has no WINDOW_LENGTHS entry, so window pace explicitly
-        # declines to judge it (says so in the reason) rather than guessing a window length --
-        # and, per the general no-percent-alone-escalation rule, a high percent with no burn
-        # sample stays 'normal'.
+        # An unknown kind has no WINDOW_LENGTHS entry, so window pace explicitly declines to
+        # judge it (says so in the reason) rather than guessing a window length -- and, per the
+        # general no-percent-alone-escalation rule, a high percent with no burn sample stays
+        # 'normal'.
         unknown = self._limit(kind="mystery_meter", percent=75)
         posture, reason = self.mod.limit_posture(unknown)
-        self.assertEqual(posture, "normal")
+        self.assertEqual(posture, "cruise")
         self.assertIn("window length unknown for kind 'mystery_meter'", reason)
 
     def test_low_percent_high_pace_escalates(self):
-        # The screenshot case: only 20% used, but burning ~1.5x sustainable -> escalates off
-        # 'normal' on pace alone. reset 15000s, burn +8% / 1000s -> exhaust in 10000s, ratio
-        # 15000/10000 = 1.5 -> frugal provisional. v3: the downtime cap then looks at what
-        # emptying this session actually costs -- margin-adjusted earliest exhaust (session,
-        # optimistic /0.85) is ~11765s, leaving D ~= 3235s (~54m) before the 15000s reset, inside
-        # the [900s,3600s) 'measured' cap band -- so the terminal rung is 'measured', one below
-        # the pace-alone 'frugal'. Still well above 'normal', which is the property this test
-        # protects: a low percent burning fast must not read as fine.
+        # Only 20% used, but burning ~1.5x sustainable -> escalates off 'normal' on pace alone.
+        # reset 15000s, burn +8% / 1000s -> exhaust in 10000s, ratio 15000/10000 = 1.5 -> frugal
+        # provisional. The downtime cap then looks at what emptying this session actually costs
+        # -- margin-adjusted earliest exhaust (session, optimistic /0.85) is ~11765s, leaving
+        # D ~= 3235s (~54m) before the 15000s reset, inside the [900s,3600s) 'measured' cap band
+        # -- so the terminal rung is 'measured', one below the pace-alone 'frugal'. Still well
+        # above 'normal', which is the property this test protects: a low percent burning fast
+        # must not read as fine.
         l = self._limit(kind="session", percent=20, resets_in_seconds=15000,
                         burn={"delta_percent": 8.0, "over_seconds": 1000})
-        self.assertEqual(self.mod.limit_posture(l)[0], "measured")
+        self.assertEqual(self.mod.limit_posture(l)[0], "coast")
 
 
 class TestOverallPosture(CheckUsageTestCase):
     def test_worst_wins(self):
-        # resets_in_seconds=None used to be irrelevant because the (now-deleted) percent axis
-        # judged purely on fullness. Under pace-only posture, a None reset means NEITHER pace
-        # axis can be judged (window pace needs a real reset_s to locate the window), so all
-        # three limits would silently read 'normal' and this test would stop testing worst-wins
-        # at all. Given real reset times instead, chosen so each limit's window pace lands on a
+        # Under pace-only posture, a None reset means NEITHER pace axis can be judged (window
+        # pace needs a real reset_s to locate the window), so all three limits would silently
+        # read 'normal' and this test would stop testing worst-wins at all. Real reset times are
+        # given instead, chosen so each limit's window pace lands on a
         # distinct rung: session at 20% of its window elapsed with 10% consumed -> ratio 0.2 ->
         # normal; weekly_all at 10% of its window elapsed with 95% already consumed -> ratio 9.5
         # -> wind_down; weekly_scoped at 50% elapsed with 76% consumed -> ratio 1.52 -> frugal.
@@ -266,19 +251,18 @@ class TestOverallPosture(CheckUsageTestCase):
              "resets_in_seconds": int(self.mod.WINDOW_LENGTHS["weekly_scoped"] * 0.5)},
         ]
         posture, driver, reason = self.mod.overall_posture(limits)
-        self.assertEqual(posture, "wind_down")
+        self.assertEqual(posture, "brake")
         self.assertIs(driver, limits[1])
 
     def test_all_normal(self):
-        # overall_posture's docstring (2026-08-11) now guarantees a driver is returned even at
-        # 'normal' -- "why is it normal" was exactly the question nobody could answer during the
-        # incident, so the single limit is always named as the driver rather than driver being
-        # None whenever nothing escalates.
+        # overall_posture guarantees a driver is returned even at 'normal', so the single limit
+        # is always named as the driver rather than driver being None whenever nothing escalates
+        # -- an answer to "why is it normal" is always available.
         limits = [
             {"kind": "session", "percent": 1, "severity": None, "resets_in_seconds": None},
         ]
         posture, driver, reason = self.mod.overall_posture(limits)
-        self.assertEqual(posture, "normal")
+        self.assertEqual(posture, "cruise")
         self.assertIs(driver, limits[0])
 
 
@@ -367,48 +351,46 @@ class TestPacePosture(CheckUsageTestCase):
                 "burn": {"delta_percent": rate * 1000, "over_seconds": 1000}}
 
     def test_sustainable_pace_is_normal(self):
-        self.assertEqual(self.mod.pace_posture(self._limit(0.5))[0], "normal")
+        self.assertEqual(self.mod.pace_posture(self._limit(0.5))[0], "cruise")
 
     def test_band_rungs(self):
-        self.assertEqual(self.mod.pace_posture(self._limit(1.1))[0], "measured")
-        self.assertEqual(self.mod.pace_posture(self._limit(1.5))[0], "frugal")
-        self.assertEqual(self.mod.pace_posture(self._limit(3.0))[0], "conserve")
-        self.assertEqual(self.mod.pace_posture(self._limit(5.0))[0], "wind_down")
+        self.assertEqual(self.mod.pace_posture(self._limit(1.1))[0], "coast")
+        self.assertEqual(self.mod.pace_posture(self._limit(1.5))[0], "brake")
+        self.assertEqual(self.mod.pace_posture(self._limit(3.0))[0], "brake")
+        self.assertEqual(self.mod.pace_posture(self._limit(5.0))[0], "brake")
 
     def test_no_burn_is_normal(self):
         l = {"kind": "session", "percent": 20, "resets_in_seconds": 10000, "burn": None}
-        self.assertEqual(self.mod.pace_posture(l)[0], "normal")
+        self.assertEqual(self.mod.pace_posture(l)[0], "cruise")
 
     def test_no_more_imminent_exhaustion_backstop_in_pace_posture(self):
-        # Replaces test_imminent_exhaustion_floors_at_conserve: the v2 absolute-runway backstop
-        # (floor at 'conserve' inside 30 minutes of projected exhaustion) was deleted from
-        # pace_posture in v3. Same shape as the old test -- ratio ~1.1, exhaust 1500s (< the
-        # renamed IMMINENT_RUNWAY_S=1800) -- but pace_posture on its own now reports plain
-        # 'measured' off the ratio alone; the backstop's old job (never RAISING a rung, unlike the
-        # old backstop) moved to `imminent` (see TestImminentAndDowntimeFields below) plus the
-        # downtime cap in limit_posture, which can only lower a rung, not raise it the way this
-        # backstop used to.
+        # pace_posture never floors a rung on absolute runway alone: with ratio ~1.1 and exhaust
+        # 1500s (< IMMINENT_RUNWAY_S=1800), it reports plain 'measured' off the ratio alone.
+        # Runway-aware behavior that can never RAISE a rung lives instead in `imminent` (see
+        # TestImminentAndDowntimeFields below) and the downtime cap in limit_posture, which can
+        # only lower a rung.
         l = {"kind": "session", "percent": 90, "resets_in_seconds": 1650,
              "burn": {"delta_percent": (10 / 1500) * 1000, "over_seconds": 1000}}
         ratio, exhaust = self.mod.pace_info(l)
         self.assertLess(ratio, 1.25)
         self.assertLessEqual(exhaust, self.mod.IMMINENT_RUNWAY_S)
-        self.assertEqual(self.mod.pace_posture(l)[0], "measured")
+        self.assertEqual(self.mod.pace_posture(l)[0], "coast")
 
     def test_weekly_within_horizon_reaches_middle_rung(self):
-        # Regression for the binary-pace bug: a weekly limit near its reset must be able to land on
-        # a middle rung, not jump straight to wind_down. 85%, 3h to reset, +2%/900s -> exhaust
+        # Pace posture must not behave as a binary threshold: a weekly limit near its reset must
+        # be able to land on a middle rung, not jump straight to wind_down. 85%, 3h to reset,
+        # +2%/900s -> exhaust
         # ~6750s, ratio ~1.6 -> frugal.
         l = {"kind": "weekly_all", "percent": 85, "resets_in_seconds": 10800,
              "burn": {"delta_percent": 2.0, "over_seconds": 900}}
-        self.assertEqual(self.mod.pace_posture(l)[0], "frugal")
+        self.assertEqual(self.mod.pace_posture(l)[0], "brake")
 
     def test_weekly_beyond_horizon_pace_is_normal(self):
-        # Same fast burn but reset is days out: a 15-min burst must not extrapolate -> pace normal,
-        # so a heavy session no longer slams the weekly limit to wind_down.
+        # Same fast burn but reset is days out: a 15-min burst must not extrapolate -> pace stays
+        # normal, so a heavy session does not slam the weekly limit to wind_down.
         l = {"kind": "weekly_all", "percent": 40, "resets_in_seconds": 259200,
              "burn": {"delta_percent": 3.0, "over_seconds": 900}}
-        self.assertEqual(self.mod.pace_posture(l)[0], "normal")
+        self.assertEqual(self.mod.pace_posture(l)[0], "cruise")
 
     def test_imminent_backstop_does_not_fire_when_sustainable(self):
         # Tiny exhaust window but reset is even sooner (ratio < 1) -> pace is normal, backstop off.
@@ -416,7 +398,7 @@ class TestPacePosture(CheckUsageTestCase):
              "burn": {"delta_percent": (10 / 1000) * 1000, "over_seconds": 1000}}
         ratio, _ = self.mod.pace_info(l)
         self.assertLess(ratio, 1.0)
-        self.assertEqual(self.mod.pace_posture(l)[0], "normal")
+        self.assertEqual(self.mod.pace_posture(l)[0], "cruise")
 
 
 class TestPaceInJsonOutput(CheckUsageTestCase):
@@ -436,23 +418,22 @@ class TestPaceInJsonOutput(CheckUsageTestCase):
         self.assertAlmostEqual(pace["ratio"], 1.5, places=2)   # 15000s reset / 10000s exhaust
         self.assertEqual(pace["exhaust_seconds"], 10000)
         # Low percent (20) but unsustainable pace -> escalates off 'normal'. `pace` itself is the
-        # raw, uncapped reading (still 1.5x here); `posture` is v3's capped terminal rung -- see
-        # test_low_percent_high_pace_escalates for the D/cap arithmetic (same limit shape here:
-        # D ~= 3235s -> 'measured' cap, one below the pace-alone 'frugal').
-        self.assertEqual(payload["posture_computed"], "measured")
-        self.assertEqual(payload["posture"], "measured")
+        # raw, uncapped reading (still 1.5x here); `posture` is the downtime-capped terminal rung
+        # -- see test_low_percent_high_pace_escalates for the D/cap arithmetic (same limit shape
+        # here: D ~= 3235s -> 'measured' cap, one below the pace-alone 'frugal').
+        self.assertEqual(payload["posture_computed"], "coast")
+        self.assertEqual(payload["posture"], "coast")
 
     def test_render_pace_null_without_burn_baseline(self):
-        # Burn pace (needs a sample) is still null with no history baseline -- unchanged. Window
-        # pace needs no sample, so it judges this limit anyway, and judges it fine: session window
-        # 18000s with resets_in 15000 leaves 83.3% of the window still to run, and 80% of the
-        # budget unspent, so headroom = 0.80 / 0.8333 = 0.96 -- nearly a full budget pace still
-        # affordable from here -> 'normal'.
+        # Burn pace (needs a sample) is still null with no history baseline. Window pace needs no
+        # sample, so it judges this limit anyway, and judges it fine: session window 18000s with
+        # resets_in 15000 leaves 83.3% of the window still to run, and 80% of the budget unspent,
+        # so headroom = 0.80 / 0.8333 = 0.96 -- nearly a full budget pace still affordable from
+        # here -> 'normal'.
         #
-        # Worth noting against the earlier draft of this change, which banded on consumed/elapsed
-        # (ratio 1.2) and called this 'measured'. Banding on headroom instead is what stops the
-        # governor reacting to a perfectly healthy 20% session, and is why the two pace axes do
-        # not share a band table.
+        # Banding on headroom rather than on consumed/elapsed is what keeps posture from reacting
+        # to a perfectly healthy 20% session, and is why the two pace axes do not share a band
+        # table.
         mod = self.mod
         mod.HISTORY = []
         limits = [{
@@ -462,10 +443,10 @@ class TestPaceInJsonOutput(CheckUsageTestCase):
         code, out = self.run_with_exit(mod.render, limits, 0, False, "cache")
         payload = json.loads(out.strip().splitlines()[-1])
         self.assertIsNone(payload["limits"][0]["pace"])
-        self.assertEqual(payload["posture"], "normal")
+        self.assertEqual(payload["posture"], "coast")
         # Window pace judged it without any sample: headroom 0.96, well clear of the 0.75 rung.
         self.assertAlmostEqual(payload["limits"][0]["window_pace"]["headroom"], 0.96, places=2)
-        self.assertIn("budget pace still affordable", payload["posture_reason"])
+        self.assertIn("window-average consumption 1.25x", payload["posture_reason"])
 
 
 # --------------------------------------------------------------------------- compute_burn
@@ -517,8 +498,8 @@ class TestComputeBurn(CheckUsageTestCase):
         self.assertIsNone(limits[0]["burn"])
 
     def test_subsecond_reset_jitter_is_still_same_window(self):
-        # Regression: the endpoint jitters the sub-second part of resets_at within one window, so an
-        # exact-match same-window guard rejected every real baseline and left burn (and pace) null.
+        # The endpoint jitters the sub-second part of resets_at within one window; an exact-match
+        # same-window guard would reject every real baseline and leave burn (and pace) null.
         mod = self.mod
         limits = [{"kind": "session", "percent": 60.0,
                    "resets_at": "2026-07-14T06:09:59.760271+00:00"}]
@@ -686,7 +667,6 @@ class TestCredentialSelection(CheckUsageTestCase):
         self.mod._keychain_blob = lambda: self._blob(
             "expired-keychain-token", (self.mod.NOW - 60) * 1000)
         self.mod._file_blob = lambda: None
-        self.mod._sessionwatcher_token = lambda: None
         self.mod._process_env_token = lambda: "live-process-token"
         self.assertEqual("live-process-token", self.mod.get_access_token())
 
@@ -934,7 +914,7 @@ class Test429ClobberPreservation(CheckUsageTestCase):
         # main() calls load_cache() twice on this path: once at the top, once inside the 429
         # branch (by design, to avoid clobbering a concurrent writer). Simulate another process
         # completing a successful fetch in between by returning old_cache on the first call and
-        # new_cache (the "concurrently written" newer state) on the second -- and, since v3's
+        # new_cache (the "concurrently written" newer state) on the second -- and, since
         # hysteresis_posture() also reads/writes the cache from inside render() (its own
         # read-for-decision and read-before-write, following this exact same pattern), every call
         # from the third onward delegates to the REAL loader so it sees what's actually on disk,
@@ -987,23 +967,22 @@ class Test429ClobberPreservation(CheckUsageTestCase):
 
 
 class TestSuccessPathPreservesPostureState(CheckUsageTestCase):
-    """F1: the 200-success write in main() used to blindly overwrite the cache with a fresh
-    {fetched_at, data, last_429_at, history} dict, dropping any stored `posture_state` before
-    render() -> hysteresis_posture() ever got to read it back. That made hysteresis inert on
-    every network refresh: a run that fetched fresh data past the TTL always saw "no stored
-    state" and adopted the computed rung outright, silently discarding a held de-escalation.
+    """The 200-success write in main() must preserve any stored `posture_state` so that
+    render() -> hysteresis_posture() can read it back. Without this, hysteresis would be inert on
+    every network refresh: a run that fetches fresh data past the TTL would always see "no stored
+    state" and adopt the computed rung outright, silently discarding a held de-escalation.
     """
 
     def test_200_success_preserves_stored_posture_state_for_hysteresis(self):
         mod = self.mod
-        # Seed a prior hold: posture "conserve" was being reported, recently enough (and with
+        # Seed a prior hold: posture "brake" is held, recently enough (and with
         # no driver_resets_at) that hysteresis must still be honoring it. No `data`/`fetched_at`
         # so main() takes the network-fetch path rather than serving straight from cache.
         with open(self.cache_path, "w", encoding="utf-8") as f:
             json.dump({
                 "v": 1,
                 "posture_state": {
-                    "posture": "conserve",
+                    "posture": "brake",
                     "at": mod.NOW - 100,
                     "driver_resets_at": None,
                     "pending_downgrade": None,
@@ -1011,12 +990,12 @@ class TestSuccessPathPreservesPostureState(CheckUsageTestCase):
             }, f)
 
         mod.get_access_token = lambda: "dummy-token"
-        # A calm session limit: both pace axes read "normal" and the downtime cap does nothing
-        # (exhaustion projects well past reset), so this run's raw posture_computed is "normal" --
-        # far below the held "conserve".
+        # A calm session limit: both pace axes read "cruise" and the downtime cap does nothing
+        # (exhaustion projects well past reset), so this run's raw posture_computed is "cruise" --
+        # far below the held "brake".
         resets_at = (datetime.now(timezone.utc) + timedelta(seconds=10000)).isoformat()
         data = {"limits": [{
-            "kind": "session", "percent": 10.0, "severity": "normal", "is_active": True,
+            "kind": "session", "percent": 10.0, "severity": "cruise", "is_active": True,
             "resets_at": resets_at,
         }]}
         mod.fetch = lambda token: (200, data)
@@ -1030,12 +1009,12 @@ class TestSuccessPathPreservesPostureState(CheckUsageTestCase):
 
         self.assertEqual(code, 0)
         payload = json.loads(out.strip().splitlines()[-1])
-        self.assertEqual(payload["posture_computed"], "normal")
-        # The held "conserve" must survive this fetch-refresh: hysteresis_posture() has to be
+        self.assertEqual(payload["posture_computed"], "accelerate")
+        # The held "brake" must survive this fetch-refresh: hysteresis_posture() has to be
         # able to read it back from the cache the success path just wrote, not find it wiped.
-        self.assertEqual(payload["posture"], "conserve")
+        self.assertEqual(payload["posture"], "brake")
         self.assertIn(
-            "holding conserve pending confirmation (computed normal just now)",
+            "holding brake pending confirmation (computed accelerate just now)",
             payload["posture_reason"])
 
         with open(self.cache_path, encoding="utf-8") as f:
@@ -1045,8 +1024,8 @@ class TestSuccessPathPreservesPostureState(CheckUsageTestCase):
         self.assertEqual(written["last_429_at"], 0)
         self.assertTrue(written["history"])
         self.assertIn("posture_state", written)
-        self.assertEqual(written["posture_state"]["posture"], "conserve")
-        self.assertEqual(written["posture_state"]["pending_downgrade"]["posture"], "normal")
+        self.assertEqual(written["posture_state"]["posture"], "brake")
+        self.assertEqual(written["posture_state"]["pending_downgrade"]["posture"], "accelerate")
 
 
 # --------------------------------------------------------------------------- cache versioning
@@ -1092,16 +1071,16 @@ class TestCacheVersioning(CheckUsageTestCase):
         self.assertEqual(loaded["history"], history)
 
 
-# --------------------------------------------------------------------------- v3: downtime cap
+# --------------------------------------------------------------------------- downtime cap
 
 class TestDowntimeCapBands(CheckUsageTestCase):
     def test_cap_band_edges(self):
         # DOWNTIME_CAP_BANDS = [(900, normal), (3600, measured), (21600, frugal), (86400, conserve)]
         cases = [
-            (899, "normal"), (900, "measured"),
-            (3599, "measured"), (3600, "frugal"),
-            (21599, "frugal"), (21600, "conserve"),
-            (86399, "conserve"), (86400, None),
+            (899, "coast"), (900, "coast"),
+            (3599, "coast"), (3600, "brake"),
+            (21599, "brake"), (21600, "brake"),
+            (86399, "brake"), (86400, None),
         ]
         for D, expected in cases:
             with self.subTest(D=D):
@@ -1162,22 +1141,21 @@ class TestDowntimeInfo(CheckUsageTestCase):
         # be pushed to 0 by ratio alone on a single axis -- but the margin divides exhaust by 0.85
         # (i.e. multiplies it by ~1.176) AFTER that identity holds, so any ratio in [1.0, 1/0.85)
         # -- here ~1.09 -- still lands its margin-adjusted exhaust (~3883s) past the 3600s reset,
-        # clamping D to 0 and capping the 'measured' provisional down to 'normal'. This falsifies
-        # the spec's "cannot happen on one axis" premise (claude-usage-v3-spec.md Sec A) for
-        # `session`: that premise holds for the raw ratio identity, but not once the margin is
-        # layered on top of it, and only session's margin (< 1) can push exhaust the wrong way
-        # relative to the identity that motivated the premise -- the pool margin (> 1) only ever
-        # pulls exhaust earlier, reinforcing D > 0 rather than erasing it.
+        # clamping D to 0 and capping the 'measured' provisional down to 'normal'. So "D can't be
+        # pushed to 0 by ratio alone on a single axis" holds only for the raw ratio identity, not
+        # once the margin is layered on top of it, and only session's margin (< 1) can push
+        # exhaust the wrong way relative to that identity -- the pool margin (> 1) only ever pulls
+        # exhaust earlier, reinforcing D > 0 rather than erasing it.
         l = {"kind": "session", "percent": 50, "resets_in_seconds": 3600,
              "burn": {"delta_percent": 15.15, "over_seconds": 1000}}
         eff, D, cap = self.mod.downtime_info(l)
         self.assertGreater(eff, 3600)
         self.assertEqual(D, 0.0)
-        self.assertEqual(cap, "normal")
-        self.assertEqual(self.mod.limit_posture(l)[0], "normal")
+        self.assertEqual(cap, "coast")
+        self.assertEqual(self.mod.limit_posture(l)[0], "coast")
 
     def test_d_zero_direct_on_cap_function(self):
-        self.assertEqual(self.mod._downtime_cap_band(0), "normal")
+        self.assertEqual(self.mod._downtime_cap_band(0), "coast")
 
     def test_no_projection_on_either_axis_yields_no_cap(self):
         # No burn baseline and an unknown kind (no window length): neither axis has an exhaustion
@@ -1201,35 +1179,35 @@ class TestDowntimeInfo(CheckUsageTestCase):
         ratio, _ = self.mod.pace_info(l)
         self.assertLess(ratio, 1.0)
         posture, reason = self.mod.limit_posture(l)
-        self.assertEqual(posture, "normal")
+        self.assertEqual(posture, "accelerate")
         self.assertNotIn("capped at", reason or "")
 
     def test_reason_gains_suffix_when_cap_actually_lowers_the_rung(self):
         l = {"kind": "session", "percent": 20, "resets_in_seconds": 15000,
              "burn": {"delta_percent": 8.0, "over_seconds": 1000}}
         posture, reason = self.mod.limit_posture(l)
-        self.assertEqual(posture, "measured")
-        self.assertIn("capped at measured", reason)
-        self.assertIn("downtime before reset", reason)
+        self.assertEqual(posture, "coast")
+        self.assertIn("capped at coast", reason)
+        self.assertIn("projected interruption", reason)
 
     def test_reason_has_no_suffix_when_cap_does_not_lower_the_rung(self):
         # Front-loaded sprint (40% by day 1): D is huge (~4.7 days), well beyond every cap band,
         # so downtime_info's cap is None and the provisional 'measured' rung stands untouched.
         l = {"kind": "weekly_all", "percent": 40, "resets_in_seconds": 518400, "burn": None}
         posture, reason = self.mod.limit_posture(l)
-        self.assertEqual(posture, "measured")
+        self.assertEqual(posture, "brake")
         _, _, cap = self.mod.downtime_info(l)
         self.assertIsNone(cap)
         self.assertNotIn("capped at", reason)
 
     def test_unknown_kind_with_burn_gets_provisional_rung_and_pessimistic_cap(self):
-        # Closes the v2 gap: an unfamiliar kind gets no window pace (no WINDOW_LENGTHS entry), but
-        # burn pace is kind-agnostic, so it still gets a provisional rung off pace alone, and the
-        # v3 downtime cap (pessimistic pool margin) still governs it.
+        # An unfamiliar kind gets no window pace (no WINDOW_LENGTHS entry), but burn pace is
+        # kind-agnostic, so it still gets a provisional rung off pace alone, and the downtime cap
+        # (pessimistic pool margin) still governs it.
         l = {"kind": "mystery_meter", "percent": 30, "resets_in_seconds": 5000,
              "burn": {"delta_percent": 40.0, "over_seconds": 1000}}
         posture, reason = self.mod.limit_posture(l)
-        self.assertNotEqual(posture, "normal")
+        self.assertNotEqual(posture, "cruise")
         self.assertIn("capped at", reason)
         eff, D, cap = self.mod.downtime_info(l)
         _, burn_exhaust = self.mod.pace_info(l)
@@ -1289,13 +1267,13 @@ class TestRunwayAndImminentFields(CheckUsageTestCase):
         l = {"kind": "session", "percent": 50.0, "resets_at": "R", "resets_in_seconds": 5000,
              "severity": None, "scope_model": None, "is_active": False, "extra": None}
 
-        mod.downtime_info = lambda limit: (1799.4, 100.0, "measured")
+        mod.downtime_info = lambda limit: (1799.4, 100.0, "coast")
         code, out = self.run_with_exit(mod.render, [dict(l)], 0, False, "cache")
         lim = json.loads(out.strip().splitlines()[-1])["limits"][0]
         self.assertEqual(lim["runway_seconds"], 1799)
         self.assertTrue(lim["imminent"])
 
-        mod.downtime_info = lambda limit: (1799.6, 100.0, "measured")
+        mod.downtime_info = lambda limit: (1799.6, 100.0, "coast")
         code, out = self.run_with_exit(mod.render, [dict(l)], 0, False, "cache")
         lim = json.loads(out.strip().splitlines()[-1])["limits"][0]
         self.assertEqual(lim["runway_seconds"], 1800)
@@ -1321,7 +1299,7 @@ class TestRunwayAndImminentFields(CheckUsageTestCase):
         self.assertIn("may go unspent", out)
 
 
-class TestV3FieldsPresentOnEveryRenderPath(CheckUsageTestCase):
+class TestDerivedFieldsPresentOnEveryRenderPath(CheckUsageTestCase):
     def test_new_fields_present_regardless_of_stale_or_source(self):
         mod = self.mod
         for stale, source in [(False, "network"), (False, "cache"),
@@ -1352,11 +1330,11 @@ class TestPerLimitColors(CheckUsageTestCase):
     def test_all_five_posture_colors(self):
         length = self.mod.WINDOW_LENGTHS["weekly_all"]
         cases = [
-            (10, int(length * 0.5), "normal", "green"),
-            (40, int(length * 6 / 7), "measured", "blue"),
-            (76, int(length * 0.5), "frugal", "yellow"),
-            (90, int(length * 23 / 24), "conserve", "orange"),
-            (100, int(length * 0.5), "wind_down", "red"),
+            (10, int(length * 0.5), "accelerate", "blue"),
+            (50, int(length * 0.5), "cruise", "green"),
+            (51, int(length * 0.5), "coast", "yellow"),
+            (90, int(length * 23 / 24), "brake", "orange"),
+            (100, int(length * 0.5), "park", "red"),
         ]
         for percent, resets_in, posture, color in cases:
             with self.subTest(posture=posture):
@@ -1365,7 +1343,7 @@ class TestPerLimitColors(CheckUsageTestCase):
                          "scope_model": None, "is_active": False, "extra": None}
                 rendered = self._render_limit(limit)
                 self.assertEqual(rendered["posture"], posture)
-                self.assertEqual(rendered["color"], color)
+                self.assertEqual(rendered["posture_color"], color)
 
     def test_unavailable_and_unjudgeable_stale_are_gray(self):
         unavailable = {"kind": "usage_credit", "percent": None, "resets_at": None,
@@ -1388,7 +1366,109 @@ class TestPerLimitColors(CheckUsageTestCase):
         self.mod.HISTORY = []
         _, out = self.run_with_exit(self.mod.render, limits, 0, False, "cache-only")
         rendered = json.loads(out.strip().splitlines()[-1])["limits"]
-        self.assertEqual([limit["color"] for limit in rendered], ["green", "red"])
+        self.assertEqual([limit["posture_color"] for limit in rendered], ["blue", "red"])
+
+
+class TestDisplayPace(CheckUsageTestCase):
+    def test_average_and_recent_have_the_same_affordable_rate_units(self):
+        # 25% used halfway through: average spending 25/9000; affordable 75/9000.
+        limit = {"kind": "session", "percent": 25, "resets_in_seconds": 9000}
+        average = self.mod.display_pace_info(limit)
+        self.assertEqual(average, {"ratio": 0.33, "basis": "window_average", "color": "blue"})
+        limit["burn"] = {"delta_percent": 5, "over_seconds": 1800}
+        recent = self.mod.display_pace_info(limit)
+        self.assertEqual(recent, {"ratio": 0.33, "basis": "recent", "color": "blue"})
+
+    def test_rate_colors_are_independent_of_schedule_colors(self):
+        for ratio, color in [(0, "blue"), (.89, "blue"), (.9, "green"), (1, "green"),
+                             (1.1, "green"), (1.11, "yellow"), (2, "yellow"), (2.01, "orange")]:
+            limit = {"kind": "session", "percent": 25, "resets_in_seconds": 9000,
+                     "burn": {"delta_percent": ratio * 75, "over_seconds": 9000}}
+            # Test classification independently of the recent-sample confidence guard.
+            from unittest.mock import patch
+            with patch.object(self.mod, "pace_info", return_value=(ratio, 1000)):
+                info = self.mod.display_pace_info(limit)
+            self.assertEqual(info["color"], color)
+            self.assertEqual(self.mod.schedule_info(limit)["color"], "blue")
+
+    def test_average_fallback_remains_consistent_for_every_window(self):
+        for kind in ("session", "weekly_all", "weekly_scoped"):
+            length = self.mod.WINDOW_LENGTHS[kind]
+            for elapsed in (.1, .5, .9):
+                for percent in (0, 10, 50, 90):
+                    limit = {"kind": kind, "percent": percent,
+                             "resets_in_seconds": length * (1 - elapsed)}
+                    expected = (percent / elapsed) / ((100 - percent) / (1 - elapsed))
+                    self.assertEqual(self.mod.display_pace_info(limit)["ratio"], round(expected, 2))
+
+    def test_unavailable_or_exhausted_rate_stays_unavailable(self):
+        for kind, percent, remaining in [("mystery", 25, 9000), ("session", None, 9000),
+                                         ("session", 100, 9000), ("session", 25, None),
+                                         ("session", 0, 18000), ("session", 25, -1)]:
+            self.assertIsNone(self.mod.display_pace_info(
+                {"kind": kind, "percent": percent, "resets_in_seconds": remaining}))
+
+
+class TestScheduleColors(CheckUsageTestCase):
+    def test_four_colors_follow_the_visible_gap_in_both_windows(self):
+        for kind in ("session", "weekly_all", "weekly_scoped"):
+            length = self.mod.WINDOW_LENGTHS[kind]
+            for used, color in [(0, "blue"), (44.99, "blue"), (45, "green"),
+                                (50, "green"), (55, "green"), (55.01, "yellow"),
+                                (65, "yellow"), (65.01, "orange"), (99.49, "orange"),
+                                (99.5, "red"), (100, "red"), (101, "red")]:
+                with self.subTest(kind=kind, used=used):
+                    info = self.mod.schedule_info({"kind": kind, "percent": used,
+                                                   "resets_in_seconds": length / 2})
+                    self.assertEqual(info["expected_percent"], 50)
+                    self.assertEqual(info["deviation_percent"], round(min(100, used) - 50, 2))
+                    self.assertEqual(info["color"], color)
+
+    def test_unknown_and_expired_windows_have_no_invented_schedule(self):
+        for kind, used, remaining in [("mystery", 50, 60), ("session", None, 9000),
+                                     ("session", 50, None), ("session", 50, -1),
+                                     ("session", 50, 18001), ("session", float("nan"), 60)]:
+            self.assertIsNone(self.mod.schedule_info({"kind": kind, "percent": used,
+                                                      "resets_in_seconds": remaining}))
+
+    def test_full_quota_is_red_even_when_it_matches_the_schedule_target(self):
+        for kind in ("session", "weekly_all", "weekly_scoped"):
+            for used, remaining, color in [(0, self.mod.WINDOW_LENGTHS[kind], "green"),
+                                            (99.49, 0, "green"), (99.5, 0, "red"), (100, 0, "red")]:
+                self.assertEqual(self.mod.schedule_info({"kind": kind, "percent": used,
+                                                          "resets_in_seconds": remaining})["color"], color)
+
+    def test_display_color_does_not_change_throttling_posture(self):
+        limit = {"kind": "weekly_all", "percent": 10, "resets_at": "R",
+                 "resets_in_seconds": 302400, "scope_model": None,
+                 "is_active": False, "extra": None}
+        self.mod.HISTORY = []
+        _, out = self.run_with_exit(self.mod.render, [limit], 0, False, "cache-only")
+        rendered = json.loads(out.strip().splitlines()[-1])["limits"][0]
+        self.assertEqual(rendered["color"], "blue")
+        self.assertEqual(rendered["posture_color"], "blue")
+        self.assertEqual(rendered["posture"], "accelerate")
+
+    def test_schedule_agrees_with_window_pace_headroom_and_surplus(self):
+        for kind in ("session", "weekly_all", "weekly_scoped"):
+            length = self.mod.WINDOW_LENGTHS[kind]
+            for elapsed in (0.1, 0.25, 0.5, 0.8, 0.99):
+                for used in (0, 10, 30, 50, 80, 100):
+                    with self.subTest(kind=kind, elapsed=elapsed, used=used):
+                        limit = {"kind": kind, "percent": used,
+                                 "resets_in_seconds": length * (1 - elapsed)}
+                        schedule = self.mod.schedule_info(limit)
+                        ratio, headroom, _ = self.mod.window_pace_info(limit)
+                        self.assertAlmostEqual(schedule["expected_percent"], elapsed * 100)
+                        self.assertAlmostEqual(ratio * schedule["expected_percent"], used)
+                        self.assertAlmostEqual(headroom, 1 - schedule["deviation_percent"]
+                                               / (100 - schedule["expected_percent"]))
+                        surplus = self.mod.surplus_info(limit)
+                        if surplus:
+                            self.assertAlmostEqual(surplus["projected_final_percent"],
+                                                   round(100 * ratio, 1))
+                            self.assertAlmostEqual(surplus["unspent_percent"],
+                                                   round(100 * (1 - ratio), 1))
 
 
 class TestExhaustedAndUnjudgeableLimits(CheckUsageTestCase):
@@ -1416,7 +1496,8 @@ class TestExhaustedAndUnjudgeableLimits(CheckUsageTestCase):
             with self.subTest(kind=kind, percent=percent, resets_in=resets_in):
                 payload = self._payload(self._limit(kind, percent, resets_in))
                 limit = payload["limits"][0]
-                self.assertEqual(limit["posture"], "wind_down")
+                self.assertEqual(limit["posture"], "park")
+                self.assertEqual(limit["posture_color"], "red")
                 self.assertEqual(limit["color"], "red")
                 self.assertIn("limit exhausted", payload["posture_reason"])
 
@@ -1451,13 +1532,13 @@ class TestExhaustedAndUnjudgeableLimits(CheckUsageTestCase):
 
     def test_stale_expired_window_at_100_is_still_red(self):
         payload = self._payload(self._limit(percent=100, resets_in=-500), stale=True)
-        self.assertEqual(payload["limits"][0]["color"], "red")
+        self.assertEqual(payload["limits"][0]["posture_color"], "red")
 
     def test_exhausted_limit_drives_healthy_limit(self):
         exhausted = self._limit("session", 100, 300)
         healthy = self._limit("weekly_all", 10, self.mod.WINDOW_LENGTHS["weekly_all"] // 2)
         posture, driver, reason = self.mod.overall_posture([healthy, exhausted])
-        self.assertEqual(posture, "wind_down")
+        self.assertEqual(posture, "park")
         self.assertIs(driver, exhausted)
         self.assertIn("limit exhausted", reason)
 
@@ -1465,16 +1546,16 @@ class TestExhaustedAndUnjudgeableLimits(CheckUsageTestCase):
         exhausted = self._limit("session", 100, 300)
         paced = self._limit("weekly_all", 99, self.mod.WINDOW_LENGTHS["weekly_all"] // 2)
         posture, driver, reason = self.mod.overall_posture([paced, exhausted])
-        self.assertEqual(posture, "wind_down")
+        self.assertEqual(posture, "park")
         self.assertIs(driver, exhausted)
         self.assertIn("limit exhausted", reason)
 
     def test_hysteresis_releases_exhausted_driver_after_its_real_reset(self):
         reset = datetime.fromtimestamp(self.mod.NOW - 5, timezone.utc).isoformat()
         first = self._payload(self._limit(percent=100, resets_in=-5, resets_at=reset))
-        self.assertEqual(first["posture"], "wind_down")
+        self.assertEqual(first["posture"], "park")
         second = self._payload(self._limit(percent=10, resets_in=9000, resets_at=reset))
-        self.assertEqual(second["posture"], "normal")
+        self.assertEqual(second["posture"], "accelerate")
 
 
 class TestCacheOnlyMode(CheckUsageTestCase):
@@ -1584,7 +1665,7 @@ class TestAuthorizationErrorFallbacks(CheckUsageTestCase):
         self.assertEqual(self.mod.NOW, self.mod.load_cache()["last_429_at"])
 
 
-# --------------------------------------------------------------------------- v3: surplus
+# --------------------------------------------------------------------------- surplus
 
 class TestSurplusInfo(CheckUsageTestCase):
     def _limit(self, kind, percent, resets_in):
@@ -1649,14 +1730,14 @@ class TestSurplusInfo(CheckUsageTestCase):
         l = self._limit("weekly_all", 37.0, length // 2)
         self.assertIsNotNone(self.mod.surplus_info(l))
         posture, _ = self.mod.limit_posture(l)
-        self.assertEqual(posture, "normal")  # under-spend never escalates
+        self.assertEqual(posture, "accelerate")  # under-spend never escalates
 
 
-# --------------------------------------------------------------------------- v3: posture hysteresis
+# --------------------------------------------------------------------------- posture hysteresis
 
 class TestHysteresisPosture(CheckUsageTestCase):
     def _seed_state(self, **overrides):
-        state = {"posture": "frugal", "at": self.mod.NOW - 10,
+        state = {"posture": "brake", "at": self.mod.NOW - 10,
                  "driver_resets_at": None, "pending_downgrade": None}
         state.update(overrides)
         self.mod.save_cache({"fetched_at": self.mod.NOW, "data": {"limits": []},
@@ -1664,54 +1745,54 @@ class TestHysteresisPosture(CheckUsageTestCase):
         return state
 
     def test_no_stored_state_adopts_computed(self):
-        posture, note = self.mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture, "frugal")
+        posture, note = self.mod.hysteresis_posture("brake", None)
+        self.assertEqual(posture, "brake")
         self.assertIsNone(note)
 
     def test_escalation_adopts_immediately(self):
-        self._seed_state(posture="measured", at=self.mod.NOW - 10)
-        posture, note = self.mod.hysteresis_posture("wind_down", None)
-        self.assertEqual(posture, "wind_down")
+        self._seed_state(posture="coast", at=self.mod.NOW - 10)
+        posture, note = self.mod.hysteresis_posture("park", None)
+        self.assertEqual(posture, "park")
         self.assertIsNone(note)
 
     def test_tie_keeps_computed_and_clears_pending(self):
-        self._seed_state(posture="frugal", at=self.mod.NOW - 10,
-                         pending_downgrade={"posture": "measured", "first_at": self.mod.NOW - 500})
-        posture, note = self.mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture, "frugal")
+        self._seed_state(posture="brake", at=self.mod.NOW - 10,
+                         pending_downgrade={"posture": "coast", "first_at": self.mod.NOW - 500})
+        posture, note = self.mod.hysteresis_posture("brake", None)
+        self.assertEqual(posture, "brake")
         self.assertIsNone(note)
         with open(self.cache_path, encoding="utf-8") as f:
             written = json.load(f)
         self.assertIsNone(written["posture_state"]["pending_downgrade"])
 
     def test_first_sighting_of_downgrade_holds_stored_and_records_pending(self):
-        self._seed_state(posture="conserve", at=self.mod.NOW - 10, pending_downgrade=None)
-        posture, note = self.mod.hysteresis_posture("measured", None)
-        self.assertEqual(posture, "conserve")
-        self.assertIn("holding conserve", note)
-        self.assertIn("computed measured", note)
+        self._seed_state(posture="brake", at=self.mod.NOW - 10, pending_downgrade=None)
+        posture, note = self.mod.hysteresis_posture("coast", None)
+        self.assertEqual(posture, "brake")
+        self.assertIn("holding brake", note)
+        self.assertIn("computed coast", note)
         with open(self.cache_path, encoding="utf-8") as f:
             written = json.load(f)
         pending = written["posture_state"]["pending_downgrade"]
         self.assertIsNotNone(pending)
-        self.assertEqual(pending["posture"], "measured")
+        self.assertEqual(pending["posture"], "coast")
 
     def test_downgrade_confirmed_after_120s_adopts_computed(self):
         first_at = self.mod.NOW - 130  # >= HYSTERESIS_CONFIRM_S (120) ago
-        self._seed_state(posture="conserve", at=self.mod.NOW - 10,
-                         pending_downgrade={"posture": "frugal", "first_at": first_at})
+        self._seed_state(posture="brake", at=self.mod.NOW - 10,
+                         pending_downgrade={"posture": "brake", "first_at": first_at})
         # Confirmation only requires "still below stored rank", not a match to the originally
         # pending rung -- 'measured' (also below 'conserve') at >=120s since first_at confirms.
-        posture, note = self.mod.hysteresis_posture("measured", None)
-        self.assertEqual(posture, "measured")
+        posture, note = self.mod.hysteresis_posture("coast", None)
+        self.assertEqual(posture, "coast")
         self.assertIsNone(note)
 
     def test_downgrade_not_yet_confirmed_still_holds(self):
         first_at = self.mod.NOW - 50  # < 120s ago
-        self._seed_state(posture="conserve", at=self.mod.NOW - 10,
-                         pending_downgrade={"posture": "frugal", "first_at": first_at})
-        posture, note = self.mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture, "conserve")
+        self._seed_state(posture="brake", at=self.mod.NOW - 10,
+                         pending_downgrade={"posture": "brake", "first_at": first_at})
+        posture, note = self.mod.hysteresis_posture("coast", None)
+        self.assertEqual(posture, "brake")
         self.assertIsNotNone(note)
         with open(self.cache_path, encoding="utf-8") as f:
             written = json.load(f)
@@ -1720,60 +1801,60 @@ class TestHysteresisPosture(CheckUsageTestCase):
 
     def test_intervening_reescalation_clears_pending(self):
         first_at = self.mod.NOW - 50
-        self._seed_state(posture="conserve", at=self.mod.NOW - 10,
-                         pending_downgrade={"posture": "frugal", "first_at": first_at})
+        self._seed_state(posture="brake", at=self.mod.NOW - 10,
+                         pending_downgrade={"posture": "brake", "first_at": first_at})
         # Recovers to >= stored rank -- clears pending even though not yet confirmed.
-        posture, note = self.mod.hysteresis_posture("conserve", None)
-        self.assertEqual(posture, "conserve")
+        posture, note = self.mod.hysteresis_posture("brake", None)
+        self.assertEqual(posture, "brake")
         self.assertIsNone(note)
         with open(self.cache_path, encoding="utf-8") as f:
             written = json.load(f)
         self.assertIsNone(written["posture_state"]["pending_downgrade"])
         # A later below-stored run must start a FRESH first_at, not resurrect the cleared one.
-        posture2, note2 = self.mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture2, "conserve")
+        posture2, note2 = self.mod.hysteresis_posture("coast", None)
+        self.assertEqual(posture2, "brake")
         with open(self.cache_path, encoding="utf-8") as f:
             written2 = json.load(f)
         self.assertNotEqual(written2["posture_state"]["pending_downgrade"]["first_at"], first_at)
 
     def test_max_age_bypass_adopts_computed(self):
-        self._seed_state(posture="wind_down", at=self.mod.NOW - 2000)  # > HYSTERESIS_MAX_AGE_S
-        posture, note = self.mod.hysteresis_posture("normal", None)
-        self.assertEqual(posture, "normal")
+        self._seed_state(posture="park", at=self.mod.NOW - 2000)  # > HYSTERESIS_MAX_AGE_S
+        posture, note = self.mod.hysteresis_posture("cruise", None)
+        self.assertEqual(posture, "cruise")
         self.assertIsNone(note)
 
     def test_driver_reset_bypass_adopts_computed(self):
-        self._seed_state(posture="wind_down", at=self.mod.NOW - 10,
+        self._seed_state(posture="park", at=self.mod.NOW - 10,
                          driver_resets_at=self.mod.NOW - 5)  # already reset
-        posture, note = self.mod.hysteresis_posture("normal", None)
-        self.assertEqual(posture, "normal")
+        posture, note = self.mod.hysteresis_posture("cruise", None)
+        self.assertEqual(posture, "cruise")
         self.assertIsNone(note)
 
     def test_unreadable_state_falls_back_to_computed(self):
         with open(self.cache_path, "w", encoding="utf-8") as f:
             f.write("not json")
-        posture, note = self.mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture, "frugal")
+        posture, note = self.mod.hysteresis_posture("brake", None)
+        self.assertEqual(posture, "brake")
         self.assertIsNone(note)
 
     def test_malformed_posture_state_falls_back_to_computed(self):
         self.mod.save_cache({"fetched_at": self.mod.NOW, "data": {"limits": []},
                              "posture_state": {"posture": "not-a-real-rung", "at": self.mod.NOW}})
-        posture, note = self.mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture, "frugal")
+        posture, note = self.mod.hysteresis_posture("brake", None)
+        self.assertEqual(posture, "brake")
         self.assertIsNone(note)
 
     def test_load_failure_falls_back_to_computed(self):
         # load_cache() is already best-effort (returns {} on any read failure); simulate that
         # contract directly rather than corrupting disk state a second way.
         self.mod.load_cache = lambda: {}
-        posture, note = self.mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture, "frugal")
+        posture, note = self.mod.hysteresis_posture("brake", None)
+        self.assertEqual(posture, "brake")
         self.assertIsNone(note)
 
     def test_driver_resets_at_recorded_from_driver(self):
         driver = {"resets_at": "2099-01-01T00:00:00+00:00"}
-        self.mod.hysteresis_posture("frugal", driver)
+        self.mod.hysteresis_posture("brake", driver)
         with open(self.cache_path, encoding="utf-8") as f:
             written = json.load(f)
         self.assertIsNotNone(written["posture_state"]["driver_resets_at"])
@@ -1784,11 +1865,11 @@ class TestHysteresisPosture(CheckUsageTestCase):
         # just normalizes that one field to None/absent, same discipline as every other
         # user-corruptible cache field this script reads back (see compute_burn's HISTORY guards).
         result = self.mod._valid_posture_state({
-            "posture": "frugal", "at": self.mod.NOW, "driver_resets_at": "not-a-number",
+            "posture": "brake", "at": self.mod.NOW, "driver_resets_at": "not-a-number",
             "pending_downgrade": {"posture": "not-a-real-rung", "first_at": self.mod.NOW},
         })
         self.assertIsNotNone(result)
-        self.assertEqual(result["posture"], "frugal")
+        self.assertEqual(result["posture"], "brake")
         self.assertIsNone(result["driver_resets_at"])
         self.assertIsNone(result["pending_downgrade"])
 
@@ -1798,21 +1879,21 @@ class TestHysteresisPosture(CheckUsageTestCase):
         # rest of this file's "every cache read is treated as corruptible" discipline). Exercise
         # it directly by monkeypatching load_cache the same way other tests in this class do.
         self.mod.load_cache = lambda: None
-        posture, note = self.mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture, "frugal")
+        posture, note = self.mod.hysteresis_posture("brake", None)
+        self.assertEqual(posture, "brake")
         self.assertIsNone(note)
         with open(self.cache_path, encoding="utf-8") as f:
             written = json.load(f)
-        self.assertEqual(written["posture_state"]["posture"], "frugal")
+        self.assertEqual(written["posture_state"]["posture"], "brake")
 
 
 class TestHysteresisIntegrationWithRender(CheckUsageTestCase):
     def test_posture_computed_emitted_and_reason_suffix_while_holding(self):
         mod = self.mod
         mod.save_cache({"fetched_at": mod.NOW, "data": {"limits": []},
-                        "posture_state": {"posture": "conserve", "at": mod.NOW - 10,
+                        "posture_state": {"posture": "brake", "at": mod.NOW - 10,
                                           "driver_resets_at": None,
-                                          "pending_downgrade": {"posture": "normal",
+                                          "pending_downgrade": {"posture": "cruise",
                                                                 "first_at": mod.NOW - 10}}})
         # provisional/computed 'normal': plenty of headroom, half the window elapsed.
         limits = [{"kind": "session", "percent": 10.0, "resets_at": "R",
@@ -1820,10 +1901,10 @@ class TestHysteresisIntegrationWithRender(CheckUsageTestCase):
                   "is_active": False, "extra": None}]
         code, out = self.run_with_exit(mod.render, limits, 0, False, "cache")
         payload = json.loads(out.strip().splitlines()[-1])
-        self.assertEqual(payload["posture"], "conserve")             # held
-        self.assertEqual(payload["posture_computed"], "normal")      # this run's raw reading
-        self.assertIn("holding conserve", payload["posture_reason"])
-        self.assertIn("computed normal", payload["posture_reason"])
+        self.assertEqual(payload["posture"], "brake")             # held
+        self.assertEqual(payload["posture_computed"], "accelerate")      # this run's raw reading
+        self.assertIn("holding brake", payload["posture_reason"])
+        self.assertIn("computed accelerate", payload["posture_reason"])
 
 
 class TestPostureStateClobberPreservation(CheckUsageTestCase):
@@ -1851,14 +1932,14 @@ class TestPostureStateClobberPreservation(CheckUsageTestCase):
             return real_load_cache()
 
         mod.load_cache = fake_load_cache
-        posture, note = mod.hysteresis_posture("frugal", None)
-        self.assertEqual(posture, "frugal")
+        posture, note = mod.hysteresis_posture("brake", None)
+        self.assertEqual(posture, "brake")
         with open(self.cache_path, encoding="utf-8") as f:
             written = json.load(f)
         self.assertEqual(written["last_429_at"], mod.NOW)
         self.assertEqual(len(written["history"]), 1)
         self.assertIn("posture_state", written)
-        self.assertEqual(written["posture_state"]["posture"], "frugal")
+        self.assertEqual(written["posture_state"]["posture"], "brake")
 
 
 # --------------------------------------------------------------------------- import side effects

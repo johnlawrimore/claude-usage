@@ -4,11 +4,14 @@ future limit kinds such as usage-credit meters).
 
 Cross-platform (macOS, Windows, Linux), Python standard library only. Normally invoked through
 the small OS launchers next to it (check-usage.sh on Unix, check-usage.cmd on Windows), but it can
-be run directly with Python 3.8+.
+be run directly with Python 3.9+.
 
 Data source: the private endpoint GET https://api.anthropic.com/api/oauth/usage (the same backend
-behind claude.ai /settings/usage and Claude Code /usage). It is aggressively rate-limited, so this
-script caches responses and only hits the network on a cache miss.
+behind claude.ai /settings/usage and Claude Code /usage), plus GET
+https://api.anthropic.com/api/oauth/profile for account/organization metadata (fetched only when
+needed and cached separately). Both endpoints are on api.anthropic.com; the OAuth token is sent to
+Anthropic only. The usage endpoint is aggressively rate-limited, so this script caches responses
+and only hits the network on a cache miss.
 
 Beyond the raw percents it derives several decision aids so callers do not have to re-implement
 the policy each time:
@@ -21,14 +24,14 @@ the policy each time:
                         sample at all
   - downtime          : {seconds, cap} -- the wall-clock downtime a reset-driven wait would cost at
                         the margin-adjusted earliest exhaustion projection, and the posture cap
-                        that cost derives (v3)
+                        that cost derives
   - runway_seconds, imminent : the same earliest projection per limit, plus a flag for "about to
-                        run dry -- checkpoint now, don't throttle" (v3)
+                        run dry -- checkpoint now, don't throttle"
   - surplus           : {projected_final_percent, unspent_percent} -- underspend detection for a
-                        pool budget on track to expire unspent (v3)
-  - posture           : normal | measured | frugal | conserve | wind_down, from pace, the downtime
-                        cap, then hysteresis-smoothed run to run (v3)
-  - posture_computed  : this run's raw posture before hysteresis (v3)
+                        pool budget on track to expire unspent
+  - posture           : accelerate | cruise | coast | brake | park, from pace, the downtime
+                        cap, then hysteresis-smoothed run to run
+  - posture_computed  : this run's raw posture before hysteresis
   - posture_reason    : one line saying why posture is what it is
 
 Design note on brittleness: the endpoint's set of limit "kinds" is NOT assumed to be fixed. Model
@@ -38,8 +41,10 @@ included, and any meter that is not a 0-100 percent is surfaced under `extra` ra
 so a new kind of budget never silently reads as "all clear".
 
 Credentials (checked in order): the CLAUDE_CODE_OAUTH_TOKEN env var; the macOS Keychain item
-"Claude Code-credentials"; then <config>/.credentials.json where <config> is CLAUDE_CONFIG_DIR or
-~/.claude. The token is used in-process for the provider requests and is never printed or logged.
+"Claude Code-credentials" (account CLAUDE_CODE_KEYCHAIN_ACCOUNT or the current OS user);
+<config>/.credentials.json where <config> is CLAUDE_CONFIG_DIR or ~/.claude; then a running
+`claude` process's environment (read via `ps`, same-user only, macOS/Linux). The token is used
+in-process for the provider requests and is never printed or logged.
 
 Flags:  --json (print only the JSON line)   --fresh (ignore the cache TTL; still respects backoff)
         --cache-only (read/recompute cached data; mechanically skips credentials and network)
@@ -75,7 +80,16 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 NOW = time.time()
-VERSION = "1.0.0"
+VERSION = "2.0.0"
+
+
+def _warn(where, exc):
+    """Write a one-line diagnostic to stderr for a swallowed exception, never to stdout (which
+    would corrupt --json output) and never including any credential value."""
+    try:
+        sys.stderr.write("check-usage: %s: %s: %s\n" % (where, type(exc).__name__, exc))
+    except Exception:
+        pass
 
 
 def is_num(v):
@@ -103,24 +117,29 @@ WINDOW_MATCH_TOLERANCE_S = 300
 
 # The posture ladder, weakest to strongest. _worst walks this list, so inserting rungs Just Works.
 #
-# POSTURE REACTS TO PACE, NEVER TO PERCENT (John, 2026-08-11). Percent stays in the JSON because
-# it is the number a human reads, but it is a display fact and never a decision input. Exhaustion
-# is the narrow exception: a displayed 100% is a terminal fact, not a fullness band.
+# POSTURE REACTS TO PACE, NEVER TO PERCENT. Percent stays in the JSON because it is the number a
+# human reads, but it is a display fact and never a decision input. Exhaustion is the narrow
+# exception: a displayed 100% is a terminal fact, not a fullness band.
 #
-# What that rule is protecting against, concretely: on 2026-08-11 the weekly limit sat at 97%
-# with 2 hours left before reset. Two hours is ~1.2% of a week, so 3% remaining was AHEAD of
-# pace and nothing was wrong -- but a percent band said wind_down, worst-wins discarded the
-# correct pace reading, and all six runners in the fleet stopped working on a healthy account.
-# Fullness alone cannot tell you that, because the same 97% is fine on day 6.9 and alarming on
-# day 3. Only the clock distinguishes them, which is why the axis has to be a rate.
-LEVELS = ["normal", "measured", "frugal", "conserve", "wind_down"]
-POSTURE_COLORS = {
-    "normal": "green",
-    "measured": "blue",
-    "frugal": "yellow",
-    "conserve": "orange",
-    "wind_down": "red",
+# What that rule protects against, concretely: a weekly limit sitting at 97% with 2 hours left
+# before reset. Two hours is ~1.2% of a week, so 3% remaining is AHEAD of pace and nothing is
+# difference, because the same 97% is fine on day 6.9 and alarming on day 3 of a 7-day window.
+# Only the clock distinguishes them, which is why the axis has to be a rate.
+LEVELS = ["accelerate", "cruise", "coast", "brake", "park"]
+POSTURE_COLORS = {"accelerate": "blue", "cruise": "green", "coast": "yellow", "brake": "orange", "park": "red"}
+POSTURE_INSTRUCTIONS = {
+    "accelerate": "Increase useful work: revisit valuable deferred work, add useful parallelism, or use stronger models where they add value. Never invent work to burn quota.",
+    "cruise": "Maintain the current approach, aiming to use the available quota through reset.",
+    "coast": "Ease off new commitments and speculative extras; preserve the rigor of work already running.",
+    "brake": "Actively reduce new commitments and parallelism; use cheaper models only where the task and required gates permit.",
+    "park": "Finish and save current work, then admit no new work until capacity is available. Persist and hand off held work before waiting.",
 }
+# Cruise targets 90-100% of the currently affordable rate. These are admission
+# bands, independent of the existing quota-ring and display-multiplier colors.
+ACCELERATE_RATIO = 0.9
+PARK_RUNWAY_S = 300
+EXPANSION_MIN_ELAPSED = 0.05
+EXPANSION_MIN_UNSPENT = 2.0
 EXHAUSTED_PERCENT = 99.5  # render() rounds this and higher to the displayed value "100%"
 
 
@@ -128,86 +147,18 @@ def is_exhausted(l):
     """True exactly when this limit's displayed rounded percentage is 100% or more."""
     return is_num(l.get("percent")) and l["percent"] >= EXHAUSTED_PERCENT
 
-# --- Pace axis -----------------------------------------------------------------------------
-# Where a limit is heading. pace_ratio = actual burn rate / the rate you could afford and still
-# coast to reset, which is exactly seconds_to_reset / seconds_to_exhaustion. 1.0 means you land
-# on empty right at reset; >1 means you hit the wall early (2.0 = at the halfway mark). Bands are
-# high-to-low like the percent table. Escalation only ever starts at ratio >= 1.0, i.e. only when
-# the current pace would genuinely exhaust the window before it resets.
-PACE_BANDS = [(4.0, "wind_down"), (2.0, "conserve"), (1.25, "frugal"), (1.0, "measured")]
-# Ignore burn smaller than this (percentage points) for pace escalation: a sub-2% wiggle over a
-# short baseline extrapolates to wildly noisy rates, so it must not drive posture on its own.
+# Admission uses consumption / the rate affordable until reset. Recent samples
+# need a material change and a short enough forecast horizon. Window averages
+# supply a fallback in the same units; headroom remains diagnostic only.
 PACE_MIN_BURN_DELTA = 2.0
-# Runway threshold for the `imminent` flag (v3). A limit is "about to run dry" when the
-# margin-adjusted earliest exhaustion projection (see the Downtime cap section below) lands
-# within this many seconds AND before the reset itself. This constant used to floor posture at
-# 'conserve' directly -- the v2 absolute-runway backstop, deleted from pace_posture below. Its job
-# moved here: imminent is a signal for checkpoint discipline, never a posture escalation on its
-# own, because throttling a use-it-or-lose-it session window wastes budget that was about to
-# expire anyway (see "admission control" in SKILL.md).
-IMMINENT_RUNWAY_S = 1800
-# Only judge pace when the reset is within this horizon. Burn is a ~15-minute reading; extrapolating
-# it linearly across a multi-day weekly window is meaningless (nobody sustains a 15-minute burst for
-# three days), and doing so makes the ratio explode past every middle band so a heavy session would
-# slam a weekly limit straight to wind_down. Within the horizon -- the whole 5-hour session window,
-# and the tail of a weekly window near its reset -- a short burst does project usefully, and the
-# measured/frugal/conserve rungs become reachable. Beyond it, BURN pace reads null; the window
-# pace below still governs. 6h ties to HISTORY_MAX_AGE, the oldest baseline burn will ever use.
 PACE_MAX_HORIZON_S = 21600
-
-# --- Window pace: the same question, asked without a burn sample ----------------------------
-# Burn pace above is a ~15-minute sample extrapolated, so it needs guards against its own noise
-# (PACE_MIN_BURN_DELTA, PACE_MAX_HORIZON_S) and each guard makes it read null. Null pace used to
-# be harmless because the percent axis governed underneath it; with percent gone, a null would
-# mean no governance at all, and on 2026-08-11 the weekly limit was null for exactly this reason
-# (its burn moved 1.0 point, under the 2.0 floor).
-#
-# Nothing external is missing, though: percent-consumed and the clock are both always present,
-# so pace can be computed directly with no sampling, no baseline and no history --
-#
-#     ratio = (consumed / 100) / (elapsed_window_seconds / window_length_seconds)
-#
-# -- the fraction of the budget spent against the fraction of the window used to spend it. 1.0
-# means dead on budget; >1 means this window empties before it resets. It is defined at every
-# instant of every window, including at 100% consumed, where it degrades exactly right rather
-# than needing a special case.
-#
-# This is a rate over a rate, not a threshold on fullness: 97% reads 0.98 (normal) on day 6.9 and
-# 2.26 (wind_down, via headroom 0.05 -- see WINDOW_HEADROOM_BANDS below) on day 3. The clock is
-# load-bearing, which is what separates it from the percent axis that was removed. It consumes
-# the percent FIELD, as burn pace always has (`remaining = 100 - pct`); what the rule bans is
-# deciding on fullness alone.
-#
-# Window length is a physical property of each window, the unit this formula is expressed in --
-# not per-kind posture logic. One formula, one band table, these are its units. An unknown kind
-# gets no window pace (and says so) rather than a guessed length.
+# Earlier checkpoint warning, independent of the five-minute Park reserve.
+IMMINENT_RUNWAY_S = 1800
 WINDOW_LENGTHS = {
     "session": 5 * 3600,
     "weekly_all": 7 * 24 * 3600,
     "weekly_scoped": 7 * 24 * 3600,
 }
-# The window axis does NOT band on that ratio, and does not share PACE_BANDS. It bands on
-# HEADROOM: the multiple of budget pace you can still afford from now until reset.
-#
-#     headroom = (1 - consumed_fraction) / (1 - elapsed_fraction)
-#              = remaining budget / remaining time, in budget-pace units
-#
-# h = 1.0 means you can spend at exactly budget pace the rest of the way; 0.5 means half speed
-# from here; 0 means stop. Escalation runs DOWNWARD -- the bands trip as h falls.
-#
-# Why headroom rather than the ratio: a flat threshold on consumed/elapsed cannot serve a window
-# that drains. The ratio's own ceiling is 1/elapsed_fraction, so `wind_down` at 4.0 is
-# arithmetically unreachable past the first quarter of any window, while early on the same ratio
-# explodes on a tiny denominator and needs a cap bolted on to stay sane. Headroom is well behaved
-# at both ends: early it is ~= 1 - consumed, and late it collapses precisely when the runway does.
-# Banding h is algebraically an elapsed-dependent threshold on the ratio -- the bands tighten as
-# the window drains -- but it falls out of one formula instead of being hand-tuned per rung.
-#
-# It also subsumes two things that used to be special cases. A window seconds from reset gives a
-# huge h and reads normal without the session-only near-reset relief that was deleted; a window
-# fully consumed gives h = 0 and reads wind_down without the `remaining <= 0` null that used to
-# hand the question to the percent axis.
-WINDOW_HEADROOM_BANDS = [(0.10, "wind_down"), (0.25, "conserve"), (0.50, "frugal"), (0.75, "measured")]
 
 # Snapshots kept for burn-rate math; populated from the cache in main().
 HISTORY = []
@@ -242,25 +193,21 @@ def fetch(token):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        # Preserve WHY the endpoint refused. This used to `return e.code, None`,
-        # which discarded the body and every header -- so a 429 was
-        # indistinguishable from any other 429, with no way to tell a "slow
-        # down for N seconds" from a longer-horizon refusal. A two-hour outage
-        # was diagnosed blind because of it. `Retry-After` in particular is the
-        # server telling us exactly how long to wait; throwing it away and
-        # substituting our own fixed 900s guess is strictly worse information.
-        # Errors here are swallowed: a diagnostic must never turn a handled
-        # HTTP error into an unhandled exception.
+        # Preserve WHY the endpoint refused, rather than discarding the body and every header:
+        # a 429 with a `Retry-After` header tells us exactly how long to wait, which is strictly
+        # better information than falling back to our own fixed guess. Diagnostic capture itself
+        # is wrapped so that a header/body-parsing failure here degrades to less diagnostic detail
+        # rather than turning a handled HTTP error into an unhandled exception.
         detail = {"headers": {}, "body": None}
         try:
             detail["headers"] = {k.lower(): v for k, v in e.headers.items()}
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn("fetch: header capture", exc)
         try:
             raw = e.read().decode("utf-8", "replace")
             detail["body"] = raw[:2000] if raw else None
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn("fetch: body capture", exc)
         _record_http_error(e.code, detail)
         return e.code, None
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
@@ -286,13 +233,13 @@ def fetch_account(token):
         detail = {"headers": {}, "body": None}
         try:
             detail["headers"] = {k.lower(): v for k, v in e.headers.items()}
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn("fetch_account: header capture", exc)
         try:
             raw = e.read().decode("utf-8", "replace")
             detail["body"] = raw[:2000] if raw else None
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn("fetch_account: body capture", exc)
         _record_http_error(e.code, detail, endpoint="profile")
         return e.code, None
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as error:
@@ -372,22 +319,19 @@ def _record_http_error(status, detail, endpoint="usage"):
             fresh["profile_failed_at"] = NOW
             fresh["profile_status"] = status
         save_cache(fresh)
-    except Exception:
-        pass
+    except Exception as exc:
+        _warn("_record_http_error", exc)
 
 
 def _backoff_cause(cache):
     """Describe what actually armed the backoff, rather than assuming a 429.
 
-    `last_429_at` is armed on ANY HTTP status, not just 429 -- deliberately,
-    so a recurring non-retryable error cannot hot-loop the endpoint. The cost
-    of reusing that one field is that the wait was *reported* as a rate limit
-    whatever caused it. Observed misleading readers across several sessions
-    (2026-08-16): 19 of the last 20 recorded errors were an HTTP 403
-    "does not meet scope requirement user:profile", exactly one was a real
-    429, and every report named only the 429 -- so the actionable cause (a
-    credential without the required scope) stayed invisible while the meter
-    sat 83 hours stale.
+    `last_429_at` is armed on ANY HTTP status, not just 429 -- deliberately, so a recurring
+    non-retryable error cannot hot-loop the endpoint. The cost of reusing that one field is that
+    the wait is *reported* as a rate limit whatever actually caused it, which is why this function
+    exists: it recovers the real cause (a 403 lacking the required OAuth scope, say) from the last
+    recorded error so the reported reason names the actionable problem instead of always saying
+    "rate limited".
 
     Returns (label, detail): label is short enough for the `source` field,
     detail is a full clause for `fail()`.
@@ -399,8 +343,8 @@ def _backoff_cause(cache):
         if isinstance(errors, list) and errors and isinstance(errors[-1], dict):
             latest = errors[-1]
             status = latest.get("status")
-    except Exception:
-        pass
+    except Exception as exc:
+        _warn("_backoff_cause: reading http_errors", exc)
     if status is None or status == 429:
         return "429 backoff", "endpoint rate-limited (429)"
     body = latest.get("body") or ""
@@ -413,8 +357,8 @@ def _backoff_cause(cache):
     message = ""
     try:
         message = ((json.loads(body).get("error") or {}).get("message") or "").strip()
-    except Exception:
-        pass
+    except (ValueError, AttributeError, TypeError):
+        pass  # body is not the expected {"error": {"message": ...}} shape; message stays ""
     return ("HTTP %s backoff" % status,
             "endpoint returned HTTP %s%s (not a rate limit)"
             % (status, ": " + message if message else ""))
@@ -455,7 +399,8 @@ def parse_limits(data):
             out.append({
                 "kind": l.get("kind"),
                 "percent": _num_or_none(l.get("percent")),
-                # assumption, unverified as of 2026-07: appears to mean the currently binding limit
+                # Passed through as-is; the endpoint's own semantics for this field are not
+                # publicly documented, so it is treated as informational, never load-bearing.
                 "is_active": l.get("is_active"),
                 "resets_at": resets_at,
                 "resets_in_seconds": int(s) if s is not None else None,
@@ -617,26 +562,6 @@ def _process_env_token():
     return None
 
 
-def _sessionwatcher_token():
-    """Token from SessionWatcher's credentials store (macOS), if present and unexpired.
-    SessionWatcher keeps its own auto-refreshed Claude OAuth pair, making it a reliable
-    fallback when no CLI process is running. Returns the token or None; never logs it."""
-    path = os.path.expanduser(
-        "~/Library/Application Support/SessionWatcher/credentials.json")
-    try:
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
-        exp = d.get("expiresAt")
-        if isinstance(exp, (int, float)):
-            exp_s = exp / 1000 if exp > 1e12 else exp
-            if exp_s < time.time():
-                return None
-        tok = d.get("accessToken")
-        return tok or None
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-
-
 def _blob_access_token(raw):
     """Return a stored access token only while its declared lifetime is valid.
 
@@ -659,21 +584,14 @@ def _blob_access_token(raw):
 
 def get_access_token():
     """Resolve the OAuth access token from (in order) the env override, the macOS Keychain,
-    the credentials file, SessionWatcher's store, then a running claude process's env.
-    Returns the token string or None. Never logs the value.
+    the credentials file, then a running claude process's environment. Returns the token
+    string or None. Never logs the value.
 
-    SessionWatcher moved ahead of the process-env scavenge (2026-08-13, live incident):
     `_process_env_token()` greps `pgrep -x claude` and takes whichever of up to 8 matching
-    PROCESSES happens to be found first -- on a machine running many concurrent sessions
-    (interactive, runners, subagents), that is an ARBITRARY session, not necessarily the
-    one whose account the human actually controls or intends. Confirmed live: the human
-    reported switching accounts several times; the process-scavenged token kept returning
-    HTTP 429/403 ("does not meet scope requirement user:profile") for 6+ hours regardless,
-    while SessionWatcher's own token -- a real, separately-authenticated, auto-refreshed
-    login this whole time -- succeeded on the very first live retry. The account-switching
-    was real; it just could never have reached this script, because nothing about it
-    changes which arbitrary background process pgrep finds first. Process-env stays as a
-    fallback for when SessionWatcher isn't installed, not as the primary source."""
+    processes is found first -- on a machine running several concurrent sessions that is an
+    arbitrary one, not necessarily the account the caller intends. It is kept last, as a
+    fallback for when no stored credential is available, precisely because it can pick an
+    unintended session's token."""
     env_tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if env_tok:
         return env_tok
@@ -683,7 +601,7 @@ def get_access_token():
         tok = _blob_access_token(raw)
         if tok:
             return tok
-    return _sessionwatcher_token() or _process_env_token()
+    return _process_env_token()
 
 
 # --------------------------------------------------------------------------- cache / network
@@ -926,7 +844,7 @@ def pace_info(l):
     if not isinstance(burn, dict) or not is_num(pct) or not is_num(reset_s) or reset_s <= 0:
         return None, None
     if reset_s > PACE_MAX_HORIZON_S:
-        return None, None  # too far out for a ~15-min burn to project across; percent axis governs
+        return None, None  # too far out for a ~15-min burn to project across; window-average fallback governs
     delta = burn.get("delta_percent")
     over = burn.get("over_seconds")
     if not is_num(delta) or not is_num(over) or over <= 0 or delta < PACE_MIN_BURN_DELTA:
@@ -944,18 +862,11 @@ def pace_info(l):
 def window_pace_info(l):
     """(ratio, headroom, exhaust_seconds), or (None, None, None) when the window cannot be located.
 
-    Two readings of the same window, both sample-free. `ratio` (consumed/elapsed) says how you
-    have spent SO FAR and is display data. `headroom` says what you can still afford FROM HERE --
-    remaining budget over remaining time, in budget-pace units -- and it is what posture bands on,
-    per WINDOW_HEADROOM_BANDS. exhaust_seconds is when this window hits 100% at the average rate.
-
-    Unlike pace_info this takes no sample and keeps no history, so it has no noise to guard against
-    and is defined at every instant of every window, including at 100% consumed (headroom 0) and
-    seconds before a reset (headroom large) -- the two cases that used to need special handling.
-
-    Nulls only for: an unknown kind (no window length to express the rate in), a missing percent,
-    or reset data that contradicts the window length -- clock skew, or the provider redefining the
-    window, either of which makes the constant wrong and judging on it worse than not judging.
+    Sample-free diagnostic readings: consumed/elapsed ratio, remaining headroom,
+    and exhaustion at the whole-window average rate. Admission converts exhaustion
+    to the same affordable-through-reset units as recent pace. Headroom remains a
+    diagnostic field; it does not have a separate posture ladder.
+    Unknown kinds, missing percentages, and unlocatable reset windows return nulls.
     """
     pct = l.get("percent")
     reset_s = l.get("resets_in_seconds")
@@ -976,72 +887,54 @@ def window_pace_info(l):
 
 
 def _band(ratio):
-    """Rung for a pace ratio. Escalation starts at 1.0 -- below that the window survives."""
-    for thresh, level in PACE_BANDS:  # high-to-low; first threshold at/below ratio wins
-        if ratio >= thresh:
-            return level
-    return "normal"
+    """Admission direction around the affordable-through-reset rate, not quota fullness."""
+    if ratio > 1.25:
+        return "brake"
+    if ratio > 1.0:
+        return "coast"
+    return "cruise"
 
 
 def pace_posture(l):
-    """(rung, reason) from the short-horizon burn sample.
-
-    The v2 absolute-runway backstop (floor at 'conserve' inside 30 minutes of projected
-    exhaustion) is gone. v3 replaces it with two things that do a better job of the same
-    invariant: `imminent` + the checkpoint discipline it names (a window about to run dry gets
-    finished-and-persisted, not throttled -- see IMMINENT_RUNWAY_S), and the downtime cap in
-    limit_posture, which can only LOWER a rung -- unlike the old backstop, it never raises one.
-    """
-    ratio, exhaust_seconds = pace_info(l)
+    ratio, exhaust = pace_info(l)
     if ratio is None:
-        return "normal", None  # window pace governs; see limit_posture
-    p = _band(ratio)
-    if p == "normal":
-        return p, "burn pace %.2fx sustainable" % ratio
-    return p, "burning %.2fx sustainable, empties %s before reset" % (
-        ratio, short_dur(max(0, (l.get("resets_in_seconds") or 0) - (exhaust_seconds or 0))))
-
-
-def _headroom_band(headroom):
-    """Rung for a headroom figure. Escalation runs DOWNWARD: the bands trip as headroom falls."""
-    for thresh, level in WINDOW_HEADROOM_BANDS:  # low-to-high; first threshold above h wins
-        if headroom < thresh:
-            return level
-    return "normal"
+        return "cruise", None
+    return _band(ratio), "recent consumption %.2fx the rate affordable through reset" % ratio
 
 
 def window_pace_posture(l):
-    """(rung, reason) from how much budget-pace headroom is left between now and reset."""
-    ratio, headroom, _exhaust = window_pace_info(l)
-    if headroom is None:
+    ratio, headroom, exhaust = window_pace_info(l)
+    if ratio is None:
         kind = l.get("kind")
-        length = WINDOW_LENGTHS.get(kind)
-        reset_s = l.get("resets_in_seconds")
-        if not is_num(l.get("percent")):
-            why = "no percent to judge"
-        elif not length:
-            why = "window length unknown for kind %r" % kind
-        elif not is_num(reset_s) or reset_s <= 0:
-            why = "reset missing or non-positive"
-        elif is_num(reset_s) and reset_s > length:
-            why = "reset outside window length"
-        else:
-            why = "window just reset"
-        return "normal", "window pace not judged (%s)" % why
-    p = _headroom_band(headroom)
-    pct = l.get("percent") or 0
-    reset_s = l.get("resets_in_seconds")
-    runway = (" for the %s left" % short_dur(reset_s)) if is_num(reset_s) else ""
-    if p == "normal":
-        return p, "%.0f%% spent, %.2fx budget pace still affordable%s" % (pct, headroom, runway)
-    return p, "%.0f%% spent: only %.2fx budget pace affordable%s (spent %.2fx budget so far)" % (
-        pct, headroom, runway, ratio)
+        why = ("no percent to judge" if not is_num(l.get("percent")) else
+               "window length unknown for kind %r" % kind if kind not in WINDOW_LENGTHS else
+               "window just reset" if l.get("resets_in_seconds") == WINDOW_LENGTHS.get(kind) else
+               "reset outside window length" if is_num(l.get("resets_in_seconds")) and l["resets_in_seconds"] > WINDOW_LENGTHS.get(kind, 0) else
+               "reset missing or already passed")
+        return "cruise", "window pace not judged (%s)" % why
+    affordable_ratio = 0.0 if ratio == 0 else l["resets_in_seconds"] / exhaust if exhaust and exhaust > 0 else float("inf")
+    return _band(affordable_ratio), "window-average consumption %.2fx the rate affordable through reset (%.2fx original budget pace remains affordable)" % (affordable_ratio, headroom)
+
+
+def _admission_pace(l):
+    """Use one rate/affordable-rate unit; prefer reliable recent evidence, then window average."""
+    ratio, exhaust = pace_info(l)
+    if ratio is not None:
+        return ratio, exhaust, "recent"
+    window_ratio, _, exhaust = window_pace_info(l)
+    if window_ratio is None:
+        return None, None, None
+    if window_ratio == 0:
+        return 0.0, None, "window_average"
+    if exhaust is None or exhaust <= 0:
+        return None, exhaust, "window_average"
+    return l["resets_in_seconds"] / exhaust, exhaust, "window_average"
 
 
 # --- Downtime cap: weighting escalation by the COST of exhausting a limit -------------------
 #
-# v2 banded purely on rate (pace ratio / headroom). v3 layers one structural idea on top: a
-# limit's escalation should be weighted by the cost of exhausting it, and that cost is the
+# Banding purely on rate (pace ratio / headroom) treats a limit's escalation as independent of
+# what exhausting it actually costs. This layer weights escalation by that cost, which is the
 # DOWNTIME you'd actually sit through -- D = resets_in_seconds - exhaust_effective. A session
 # limit that empties 40 minutes before its own reset costs 40 minutes of downtime; a weekly limit
 # that empties on day 4 of 7 costs three days. Banding on D turns the session/weekly asymmetry (a
@@ -1073,24 +966,9 @@ def window_pace_posture(l):
 MARGIN_SESSION_RATE = 0.85
 MARGIN_POOL_RATE = 1.15
 
-# D = max(0, resets_in_seconds - exhaust_effective). The table bands D itself, ascending (unlike
-# PACE_BANDS/WINDOW_HEADROOM_BANDS, which band a RATE high-to-low or low-to-high): under 15
-# minutes of downtime costs nothing extra (normal), under 1h -> measured, under 6h -> frugal,
-# under 1 day -> conserve; a full day or more of downtime is left uncapped (None: the provisional
-# rung, from pace alone, stands as-is).
-DOWNTIME_CAP_BANDS = [(900, "normal"), (3600, "measured"), (21600, "frugal"), (86400, "conserve")]
-# Except for terminal exhaustion, the final per-limit rung is min(provisional, cap) by LEVELS
-# index -- the cap can only LOWER a rung, never raise one. A cheap wall is a reason to relax,
-# never a reason to invent urgency pace didn't already find.
-#
-# The derived asymmetry this produces: a session window is at most 5h (18000s) long, so
-# resets_in_seconds never exceeds that, which puts D's ceiling below the 21600s frugal/conserve
-# boundary -- a session's CAP can structurally never exceed 'frugal', no matter how hard the
-# provisional rung escalates. Terminal exhaustion bypasses that cap. A weekly window's reset can
-# be up to 7 days out, so its D has no
-# such ceiling and can reach any cap, including none at all. The session/weekly split used to
-# need hand-tuned per-kind treatment (see the 2026-08-11 incident referenced at LEVELS above);
-# here it falls out of one formula and the physical length of each window.
+# A short projected interruption can soften Brake to Coast. It cannot turn
+# overspending into permission to expand or override the Park reserve.
+DOWNTIME_CAP_BANDS = [(3600, "coast"), (86400, "brake")]
 
 
 def _downtime_cap_band(D):
@@ -1104,7 +982,7 @@ def _downtime_cap_band(D):
 
 
 def downtime_info(l):
-    """(exhaust_effective, D, cap) for one limit -- the v3 downtime layer, computed independently
+    """(exhaust_effective, D, cap) for one limit -- the downtime layer, computed independently
     of and after the provisional pace/window-pace rungs (which this feeds into, capping them, in
     limit_posture) and rendered again verbatim as the `downtime`/`runway_seconds`/`imminent`
     fields in render(). Recomputing pace_info/window_pace_info here rather than threading their
@@ -1184,77 +1062,70 @@ def surplus_info(l):
 
 
 def limit_posture(l):
-    """(rung, reason) for one limit, from PACE and (v3) the downtime cap.
+    """Ride the limit: increase useful admission when underspending, reduce it before overshoot.
 
-    Two pace readings, worst wins, because they see different failures. Burn pace catches a fresh
-    burst near reset that the window average washes out. Window pace catches sustained
-    overconsumption days out, where burn pace is null by construction (PACE_MAX_HORIZON_S). That
-    worst-of-two-pace-readings rung is the PROVISIONAL rung; the downtime cap (see the "Downtime
-    cap" section above) can then only LOWER it, never raise it, when exhausting the limit would
-    cost little wall-clock downtime before the window resets anyway.
-
-    Deliberately absent, all removed 2026-08-11:
-      - the percent axis, per the rule at the top of this file. Terminal exhaustion is the narrow
-        exception: displayed 100% is a fact that the limit has stopped, not a fullness band;
-      - provider `severity`. It tracked fullness rather than sustainability and is discarded by
-        parse_limits, so it cannot leak into posture or downstream display color;
-      - the session-only near-reset relief. It existed to soften a high PERCENT shortly before
-        reset; with percent gone it has nothing to relieve, and a kind-specific carve-out in a
-        pace-only model is dead weight.
+    Existing work keeps its rigor. Park reserves checkpoint time; only terminal exhaustion uses
+    raw fullness. Unknown meters cannot authorize expansion. Downtime can soften Brake to Coast,
+    which still reduces admission: it can no longer erase an overshoot warning entirely.
     """
     if is_exhausted(l):
-        pct = l.get("percent")
-        reset_s = l.get("resets_in_seconds")
-        reason = "%.0f%% spent: limit exhausted" % pct
-        if is_num(reset_s) and reset_s > 0:
-            reason += ", resets in %s" % short_dur(reset_s)
-        return "wind_down", reason
-
-    p_burn, r_burn = pace_posture(l)
-    p_win, r_win = window_pace_posture(l)
-    p = _worst(p_burn, p_win)
-    # Report whichever reading actually set the rung; window pace wins ties because it is the one
-    # defined at every moment, so it is the more informative thing to print.
-    reason = r_win if LEVELS.index(p_win) >= LEVELS.index(p_burn) else r_burn
-    # v3 downtime cap: only ever lowers `p`, and only when it does gets a suffix explaining why --
-    # see downtime_info's docstring and the "Downtime cap" section above for the D/margin algebra.
-    _, D, cap = downtime_info(l)
-    if cap is not None and LEVELS.index(cap) < LEVELS.index(p):
-        # `reason` is always truthy here: it's r_win (window_pace_posture always returns a
-        # non-empty reason string) unless burn strictly outranks window, in which case p_burn is
-        # non-normal, which only happens when pace_posture ran the ratio-is-not-None branch --
-        # which also always returns a non-empty reason. No "or use suffix alone" fallback needed.
-        reason = "%s; capped at %s: exhaustion at current pace would cost only ~%s of downtime " \
-                 "before reset" % (reason, cap, short_dur(D))
-        p = cap
-    return p, reason
+        return "park", "%.0f%% spent: limit exhausted; finish and save, admit no new work" % l["percent"]
+    ratio, exhaust, basis = _admission_pace(l)
+    if ratio is None:
+        return window_pace_posture(l)
+    reset = l.get("resets_in_seconds")
+    margin = MARGIN_SESSION_RATE if l.get("kind") == "session" else MARGIN_POOL_RATE
+    runway = exhaust / margin if exhaust is not None else None
+    if runway is not None and runway <= PARK_RUNWAY_S and runway < reset:
+        return "park", "only ~%s adjusted runway before the limit, reset in %s; finish and save current work" % (short_dur(runway), short_dur(reset))
+    posture = _band(ratio)
+    reason = "%s consumption %.2fx the rate affordable through reset" % ("recent" if basis == "recent" else "window-average", ratio)
+    if ratio < ACCELERATE_RATIO - 1e-9:
+        # A fresh window is not evidence of waste. Expansion from a window average needs
+        # enough elapsed time and a material projected shortfall; a measured recent rate
+        # can directly show spare capacity without pretending to know future workload.
+        length = WINDOW_LENGTHS.get(l.get("kind"))
+        elapsed = (length - reset) / length if length and is_num(reset) else None
+        window_ratio = window_pace_info(l)[0]
+        projected_unused = max(0.0, 100 * (1 - window_ratio)) if window_ratio is not None else None
+        ready = basis == "recent" or (elapsed is not None and elapsed >= EXPANSION_MIN_ELAPSED
+                                      and projected_unused is not None and projected_unused >= EXPANSION_MIN_UNSPENT)
+        if ready:
+            posture = "accelerate"
+            reason += "; increase useful work toward the affordable rate"
+            if projected_unused is not None:
+                reason += " (~%.1f%% projected unused at reset at the window-average rate)" % projected_unused
+        else:
+            reason += "; cruise while the new window establishes a spending history"
+    elif posture == "cruise":
+        reason += "; maintain useful work toward reset"
+    else:
+        _, downtime, cap = downtime_info(l)
+        if cap is not None and LEVELS.index(cap) < LEVELS.index(posture):
+            posture = cap
+            reason += "; capped at %s: projected interruption only ~%s, still reduce new commitments" % (cap, short_dur(downtime))
+    return posture, reason
 
 
 def _pace_rank(l):
-    """How close this limit is to escalating, for picking a driver among equals."""
     if is_exhausted(l):
         return float("inf")
-    ratios = [r for r in (window_pace_info(l)[0], pace_info(l)[0]) if r is not None]
-    return max(ratios) if ratios else -1.0
+    ratio, _, _ = _admission_pace(l)
+    return ratio if ratio is not None else -1.0
 
 
 def overall_posture(limits):
-    """Worst per-limit posture wins; return (posture, driving_limit_or_None, reason).
-
-    A driver (and a reason) is returned even at `normal`: "why is it normal" is exactly the
-    question nobody could answer on 2026-08-11, and it costs one line to say. Ties at the same
-    rung go to whichever limit is closest to escalating, so the reason names the meter actually
-    worth watching rather than whichever happened to be listed first.
-    """
-    worst, driver, why = "normal", None, None
+    """The most restrictive applicable limit governs; expansion requires every limit to allow it."""
+    worst, driver, why = "accelerate", None, None
     for l in limits:
-        p, reason = limit_posture(l)
-        better = LEVELS.index(p) > LEVELS.index(worst)
-        tie = (driver is None) or (LEVELS.index(p) == LEVELS.index(worst)
-                                   and _pace_rank(l) > _pace_rank(driver))
-        if better or tie:
-            worst, driver, why = p, l, reason
-    return worst, driver, (("%s: %s" % (label(driver), why)) if driver and why else why)
+        posture, reason = limit_posture(l)
+        higher = LEVELS.index(posture) > LEVELS.index(worst)
+        tie = driver is None or (posture == worst and _pace_rank(l) > _pace_rank(driver))
+        if higher or tie:
+            worst, driver, why = posture, l, reason
+    if driver is None:
+        return "cruise", None, "no limits available to judge; do not expand on missing data"
+    return worst, driver, "%s: %s" % (label(driver), why)
 
 
 # --------------------------------------------------------------------------- posture hysteresis
@@ -1262,7 +1133,7 @@ def overall_posture(limits):
 # The per-run posture above (post-cap, but otherwise a fresh computation with no memory of the
 # previous run) can flap: a burn sample that wobbles across a band edge, or two axes trading off
 # which one is worst, would otherwise change the reported posture every few minutes even though
-# nothing about the account materially changed. v3 smooths that with asymmetric hysteresis on the
+# nothing about the account materially changed. Asymmetric hysteresis smooths that on the
 # TOP-LEVEL posture only (never on a per-limit rung, and never on the downtime cap): escalate
 # instantly (a real problem should never be hidden behind a confirmation delay), de-escalate only
 # after the computed rung has stayed lower for HYSTERESIS_CONFIRM_S -- a genuine improvement is
@@ -1386,6 +1257,54 @@ def label(l):
     return f"{base} ({l['scope_model']})" if l.get("scope_model") else base
 
 
+def display_pace_info(limit):
+    """One unit for the outside multiplier: rate / rate affordable through reset.
+
+    Prefer a reliable recent sample. Otherwise convert the window-average exhaustion
+    projection into the SAME units, rather than substituting consumed/elapsed.
+    This display-only reading never enters posture or its forecasts.
+    """
+    ratio, _ = pace_info(limit)
+    basis = "recent"
+    if ratio is None:
+        window_ratio, _, exhaust = window_pace_info(limit)
+        if window_ratio is None or is_exhausted(limit):
+            return None
+        basis = "window_average"
+        if window_ratio == 0:
+            ratio = 0.0
+        elif not is_num(exhaust) or exhaust <= 0:
+            return None
+        else:
+            ratio = limit["resets_in_seconds"] / exhaust
+    if not is_num(ratio):
+        return None
+    ratio = round(max(0.0, ratio), 2)
+    color = ("blue" if ratio < 0.9 else "green" if ratio <= 1.1
+             else "yellow" if ratio <= 2 else "orange")
+    return {"ratio": ratio, "basis": basis, "color": color}
+
+
+def schedule_info(limit):
+    """Display position against an even spending schedule; never a throttling input.
+
+    Compare percentage points, so equal visible gaps have equal colors in every window.
+    Five points either side of the target count as on pace; more than fifteen ahead is orange.
+    A quota displayed as 100% is always red, matching the existing exhaustion boundary.
+    """
+    percent = limit.get("percent")
+    remaining = limit.get("resets_in_seconds")
+    duration = WINDOW_LENGTHS.get(limit.get("kind"))
+    if (not is_num(percent) or not is_num(remaining) or not duration
+            or remaining < 0 or remaining > duration):
+        return None
+    expected = round(100 * (1 - remaining / duration), 2)
+    deviation = round(min(100, max(0, percent)) - expected, 2)
+    color = ("red" if is_exhausted(limit) else "blue" if deviation < -5 else "green" if deviation <= 5
+             else "yellow" if deviation <= 15 else "orange")
+    return {"expected_percent": expected, "deviation_percent": deviation, "color": color}
+
+
 def render(limits, age_secs, stale, source, next_check_seconds=None, account=None):
     # Clamp before any use: a backwards clock jump gives a negative age, which must never print as
     # "fetched -5s ago" nor push compute_burn's data_at (NOW - age_secs) into the future, which
@@ -1403,9 +1322,9 @@ def render(limits, age_secs, stale, source, next_check_seconds=None, account=Non
                              "headroom": round(wheadroom, 2),
                              "exhaust_seconds": int(wexhaust) if wexhaust is not None else None}
                             if wratio is not None else None)
-        # v3: downtime-cap transparency (the D/cap that already shaped this limit's rung inside
-        # limit_posture, via overall_posture below) plus runway/imminent and surplus. Field order
-        # per spec: appended after window_pace, in this build order.
+        # Downtime-cap transparency: the D/cap that already shaped this limit's rung inside
+        # limit_posture (via overall_posture below), plus runway/imminent and surplus, appended
+        # after window_pace in this build order.
         exhaust_eff, D, cap = downtime_info(l)
         l["downtime"] = {"seconds": int(round(D)), "cap": cap} if exhaust_eff is not None else None
         runway = int(round(exhaust_eff)) if exhaust_eff is not None else None
@@ -1424,15 +1343,19 @@ def render(limits, age_secs, stale, source, next_check_seconds=None, account=Non
         l["posture"] = limit_rung
         l["pace_judgeable"] = pace_judgeable
         if not is_num(l.get("percent")):
-            l["color"] = "gray"
+            l["posture_color"] = "gray"
         elif is_exhausted(l):
-            l["color"] = POSTURE_COLORS["wind_down"]
+            l["posture_color"] = POSTURE_COLORS["park"]
         elif not pace_judgeable:
-            l["color"] = "gray"
+            l["posture_color"] = "gray"
         else:
-            l["color"] = POSTURE_COLORS[limit_rung]
+            l["posture_color"] = POSTURE_COLORS[limit_rung]
+        l["display_pace"] = display_pace_info(l)
+        l["schedule"] = schedule_info(l)
+        l["color"] = ("red" if is_exhausted(l) else
+                      l["schedule"]["color"] if l["schedule"] is not None else "gray")
     posture_computed, driver, posture_reason = overall_posture(limits)
-    # v3: smooth the top-level posture with hysteresis (escalate instantly, de-escalate only after
+    # Smooth the top-level posture with hysteresis (escalate instantly, de-escalate only after
     # confirmation -- see hysteresis_posture's docstring). Applies on every render() path: fresh
     # cache, network success, and every stale/backoff fallback, since they all funnel through here.
     posture, hyst_note = hysteresis_posture(posture_computed, driver, persist=not CACHE_ONLY)
@@ -1494,18 +1417,18 @@ def render(limits, age_secs, stale, source, next_check_seconds=None, account=Non
         # Seconds until the NEXT allowed live-fetch attempt, when the caller
         # is showing stale data because of the 429 backoff specifically (None
         # for every other path, including other stale reasons like missing
-        # credentials, where there is no scheduled retry to name). This was
-        # previously only readable by parsing the "%ds left" the `source`
-        # string embeds for humans -- a caller wanting "next check in Xm" had
-        # to regex a prose string never meant to be parsed. This is that same
-        # number as a real field.
+        # credentials, where there is no scheduled retry to name). Provided as
+        # a real numeric field so a caller wanting "next check in Xm" never
+        # has to regex the prose `source` string, which is meant for humans.
         "next_check_seconds": next_check_seconds,
         "posture": posture,
-        # This run's raw posture before hysteresis (v3) -- differs from `posture` only while a
+        "posture_instruction": POSTURE_INSTRUCTIONS[posture],
+        "posture_policy": "ride_limit_v1",
+        # This run's raw posture before hysteresis -- differs from `posture` only while a
         # de-escalation is held pending confirmation; see hysteresis_posture.
         "posture_computed": posture_computed,
         # Why posture is what it is, in one line. Percent still appears here and on every limit
-        # because a human reads it; it just no longer decides anything.
+        # because a human reads it; it is a display fact only and never decides posture.
         "posture_reason": posture_reason,
         "posture_driver": ({
             "kind": driver["kind"],
@@ -1552,14 +1475,11 @@ def main():
 
     # 2. Recently rate-limited: don't retry yet, serve stale if we have it.
     #
-    # The wait is the SERVER's `Retry-After` when it sent one, never our own
-    # guess alone. This used to be a flat BACKOFF (900s), and that flat guess
-    # created an inescapable lockout: the endpoint answered a 429 with
-    # `Retry-After: 1772`, we retried at 900s, that early retry was refused --
-    # and the refusal rewrote `last_429_at = NOW`, restarting our clock. Every
-    # cycle retried too early and re-armed itself, so the meter could never
-    # recover on its own. Observed doing exactly that for over two and a half
-    # hours (2026-08-12).
+    # The wait is the SERVER's `Retry-After` when it sent one, never our own guess alone. A flat
+    # guess (e.g. a fixed 900s) creates an inescapable lockout whenever the server's real window is
+    # longer: an early retry gets refused, and the refusal rewrites `last_429_at = NOW`, restarting
+    # the wait clock -- every cycle retries too early and re-arms itself, so the meter never
+    # recovers on its own. Honoring the server's own `Retry-After` avoids that failure mode.
     #
     # max() rather than the raw header: if the server asks for less than our
     # own floor we still wait the floor, which only costs staleness. The cap
@@ -1693,19 +1613,16 @@ def main():
 
     # Any other HTTP status (network errors with status=None excluded --
     # those get no backoff, since connectivity blips are not the endpoint
-    # telling us anything). This used to arm no backoff at all: a 403 here
-    # ("OAuth token does not meet scope requirement user:profile", observed
-    # in production 2026-08-12/13) left `last_429_at` untouched, so the NEXT
-    # poll tick (60s later, the server's normal interval) saw the SAME
-    # already-elapsed backoff window and retried almost immediately --
-    # repeating every 60s until a 429 finally arrived and armed the real
-    # hour-long wait. Confirmed from the cache's own error history: a
-    # recurring 403, 403 (+60s), 429 (+60s) pattern, once per backoff cycle,
-    # for over 6 hours straight. Arming the same `last_429_at` here stops
-    # that hammering: the wait becomes whichever is longer of the BACKOFF
-    # floor or a still-on-record `retry_after_s` from an earlier 429 (a 403
-    # carries no Retry-After header of its own, so it never sets one, only
-    # reuses what's already there).
+    # telling us anything). A non-retryable error such as a 403 ("OAuth token
+    # does not meet scope requirement user:profile") still needs a backoff
+    # armed here: leaving `last_429_at` untouched would let the next poll
+    # tick see the same already-elapsed backoff window and retry almost
+    # immediately, repeating every poll interval until a genuine 429 finally
+    # arrived and armed the real wait. Arming the same `last_429_at` here
+    # stops that hammering: the wait becomes whichever is longer of the
+    # BACKOFF floor or a still-on-record `retry_after_s` from an earlier 429
+    # (a 403 carries no Retry-After header of its own, so it never sets one,
+    # only reuses what's already there).
     if status is not None:
         fresh = load_cache()
         fresh["last_429_at"] = NOW
